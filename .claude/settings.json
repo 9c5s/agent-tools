@@ -131,7 +131,8 @@
     "superpowers@claude-plugins-official": true,
     "svelte@svelte": true,
     "swift-lsp@claude-plugins-official": false,
-    "typescript-lsp@claude-plugins-official": false
+    "typescript-lsp@claude-plugins-official": false,
+    "9c5s@agent-tools": true
   },
   "extraKnownMarketplaces": {
     "openai-codex": {
@@ -154,6 +155,12 @@
         "repo": "cloudflare/skills"
       },
       "autoUpdate": true
+    },
+    "agent-tools": {
+      "source": {
+        "source": "github",
+        "repo": "9c5s/agent-tools"
+      }
     }
   },
   "language": "日本語",
