@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "agent-tools",
+  "description": "9c5s's skill collection for coding agents",
+  "owner": {
+    "name": "9c5s",
+    "url": "https://github.com/9c5s"
+  },
+  "plugins": [
+    {
+      "name": "9c5s",
+      "author": { "name": "9c5s" },
+      "source": "./.agents"
+    }
+  ]
+}
