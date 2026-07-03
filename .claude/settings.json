@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+    "CLAUDE_CODE_NO_FLICKER": "1",
+    "CLAUDE_CODE_USE_POWERSHELL_TOOL": "1",
+    "DISABLE_AUTOUPDATER": "0",
+    "DISABLE_ERROR_REPORTING": "1"
+  },
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  },
+  "includeCoAuthoredBy": false,
+  "permissions": {
+    "allow": [],
+    "deny": [
+      "Bash(*chmod 777 *)",
+      "Bash(*gh pr merge*)",
+      "Bash(*gh merge*)",
+      "Bash(*gh repo delete*)",
+      "Bash(*git config *)",
+      "Bash(*git add -f*)",
+      "Bash(*git add .)",
+      "Bash(*git add . *)",
+      "Bash(*git add ./)",
+      "Bash(*git add ./ *)",
+      "Bash(*git add -A*)",
+      "Bash(*git add --all*)",
+      "Bash(*git add -u*)",
+      "Bash(*git add --update*)",
+      "Bash(*git add :/*)",
+      "Bash(*rm -rf *)",
+      "PowerShell(*gh pr merge*)",
+      "PowerShell(*gh merge*)",
+      "PowerShell(*gh repo delete*)",
+      "PowerShell(*git config *)",
+      "PowerShell(*git add -f*)",
+      "PowerShell(*git add .)",
+      "PowerShell(*git add . *)",
+      "PowerShell(*git add ./)",
+      "PowerShell(*git add ./ *)",
+      "PowerShell(*git add -A*)",
+      "PowerShell(*git add --all*)",
+      "PowerShell(*git add -u*)",
+      "PowerShell(*git add --update*)",
+      "PowerShell(*git add :/*)",
+      "PowerShell(*rm -rf *)",
+      "PowerShell(*Remove-Item*-Recurse*)",
+      "PowerShell(*Remove-Item*-Force*)"
+    ],
+    "defaultMode": "auto"
+  },
+  "model": "claude-opus-4-7[1m]",
+  "hooks": {
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run ~/.claude/hooks/notify.py"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run ~/.claude/hooks/notify.py"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun ~/.claude/hooks/watch-launch.ts"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun ~/.claude/hooks/watch-stop.ts"
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "bun ~/.claude/scripts/statusline-tee.ts uv run ~/.claude/scripts/statusline.py --icons=nerd",
+    "padding": 0
+  },
+  "enabledPlugins": {
+    "chrome-devtools-mcp@claude-plugins-official": true,
+    "clangd-lsp@claude-plugins-official": false,
+    "claude-md-management@claude-plugins-official": true,
+    "cloudflare@cloudflare": true,
+    "code-review@claude-plugins-official": true,
+    "code-simplifier@claude-plugins-official": true,
+    "coderabbit@claude-plugins-official": true,
+    "codex@openai-codex": true,
+    "context7@claude-plugins-official": true,
+    "csharp-lsp@claude-plugins-official": false,
+    "discord@claude-plugins-official": true,
+    "feature-dev@claude-plugins-official": true,
+    "frontend-design@claude-plugins-official": true,
+    "gopls-lsp@claude-plugins-official": false,
+    "jdtls-lsp@claude-plugins-official": false,
+    "kotlin-lsp@claude-plugins-official": false,
+    "lua-lsp@claude-plugins-official": false,
+    "microsoft-docs@claude-plugins-official": true,
+    "php-lsp@claude-plugins-official": false,
+    "playwright-cli@playwright-cli": true,
+    "playwright@claude-plugins-official": true,
+    "pr-review-toolkit@claude-plugins-official": true,
+    "pyright-lsp@claude-plugins-official": false,
+    "ralph-loop@claude-plugins-official": true,
+    "ruby-lsp@claude-plugins-official": false,
+    "rust-analyzer-lsp@claude-plugins-official": false,
+    "security-guidance@claude-plugins-official": true,
+    "skill-creator@claude-plugins-official": true,
+    "superpowers@claude-plugins-official": true,
+    "svelte@svelte": true,
+    "swift-lsp@claude-plugins-official": false,
+    "typescript-lsp@claude-plugins-official": false
+  },
+  "extraKnownMarketplaces": {
+    "openai-codex": {
+      "source": {
+        "source": "github",
+        "repo": "openai/codex-plugin-cc"
+      },
+      "autoUpdate": true
+    },
+    "svelte": {
+      "source": {
+        "source": "github",
+        "repo": "sveltejs/ai-tools"
+      },
+      "autoUpdate": true
+    },
+    "cloudflare": {
+      "source": {
+        "source": "github",
+        "repo": "cloudflare/skills"
+      },
+      "autoUpdate": true
+    }
+  },
+  "language": "日本語",
+  "effortLevel": "xhigh",
+  "promptSuggestionEnabled": false,
+  "autoUpdatesChannel": "latest",
+  "skipDangerousModePermissionPrompt": true,
+  "preferredNotifChannel": "notifications_disabled",
+  "teammateMode": "auto",
+  "remoteControlAtStartup": true,
+  "inputNeededNotifEnabled": true,
+  "agentPushNotifEnabled": true,
+  "feedbackSurveyState": {
+    "lastShownTime": 1754086803253
+  }
+}
