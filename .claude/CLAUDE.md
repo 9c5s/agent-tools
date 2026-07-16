@@ -66,4 +66,4 @@
 ## 設計ドキュメント
 
 - superpowers 系スキル（brainstorming、writing-plans など）で作成した spec、design、plan のドキュメントは、ユーザーの明示的な指示がない限り git に commit しない（`docs/superpowers/` 配下はグローバル gitignore で除外済み）。要点はメモリに集約する
-- 明示指示で commit する場合は、リポジトリの `.gitignore` に否定パターンを追加して対象を恒久的に追跡へ戻してから、通常の add で行う（force-add や gitignore の一時的な書き換えは Git 安全規則のとおり行わない）
+- 明示指示で commit する場合は、リポジトリの `.gitignore` に否定パターンを追加して対象を恒久的に追跡へ戻してから、通常の add で行う（親ディレクトリごと ignore されている場合は親から順に再包含する。force-add や gitignore の一時的な書き換えはしない）
