@@ -49,7 +49,7 @@
 - Conventional Commits v1.0.0 (https://www.conventionalcommits.org/en/v1.0.0/) に準拠する
 - subject は「type: 日本語の要約」の 1 行のみで書く（type は英語、要約は日本語）
 - body は書かない。詳細は PR の description に記載する
-- `type(scope):` の scope 記法は使わない（`type:` のみ）
+- `type(scope):` の scope 記法は使わない（`type:` のみ）。破壊的変更は `type!:` で表す
 - プロジェクト側に独自の規約（commitlint 設定、プロジェクトの CLAUDE.md やメモリ）がある場合はそちらを優先する
 
 ## Git 安全規則
