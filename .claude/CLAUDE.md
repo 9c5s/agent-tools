@@ -82,6 +82,10 @@
 - Discord への返信で Markdown のテーブル記法を使わない（レンダリングされない）。箇条書き・段落・コードブロックで代替する
 - Discord 経由の作業では AskUserQuestion などの CLI 確認ダイアログを出さず、確認や承認は Discord の reply で取る。これは承認手順の省略を意味しない
 
+## 設計ドキュメント
+
+- superpowers 系スキル（brainstorming、writing-plans 等）で作成した spec・design・plan ドキュメントは、ユーザーの明示的な指示がない限り git に commit しない（`docs/superpowers/` 配下はグローバル gitignore で除外済み）。要点はメモリに集約する
+
 ## プロジェクト設定
 
 - メインブランチ: main
