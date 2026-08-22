@@ -106,6 +106,17 @@ class _RateLimitsInput(TypedDict, total=False):
     seven_day: _RateBucketInput
 
 
+class _ModelUsageEntry(TypedDict):
+    """使用量 API から射影したモデル別週次枠
+
+    statusline JSON には含まれないため API から取得する
+    """
+
+    display_name: str
+    percent: float
+    resets_at: float | None
+
+
 class _OutputStyleInput(TypedDict, total=False):
     """Claude Code statusline JSON の output_style フィールド"""
 
@@ -216,6 +227,11 @@ _EXCHANGE_CACHE_PATH = Path(tempfile.gettempdir()) / "claude-exchange-cache.json
 _SESSION_COST_CACHE_PATH = Path(tempfile.gettempdir()) / "claude-session-cost.json"
 _DAILY_COST_CACHE_PATH = Path(tempfile.gettempdir()) / "claude-daily-cost.json"
 _EXCHANGE_API_URL = "https://api.frankfurter.app/latest?from=USD&to={currency}"
+_USAGE_API_URL = "https://api.anthropic.com/api/oauth/usage"
+_CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
+_MODEL_USAGE_CACHE_PATH = Path(tempfile.gettempdir()) / "claude-model-usage.json"
+_MODEL_USAGE_TTL = 300  # 秒。Claude Code 本体のキャッシュ TTL と揃える
+_MODEL_USAGE_RETRY_INTERVAL = 60  # 秒。取得失敗時の再試行を抑制する間隔
 
 _CURRENCIES: dict[str, _CurrencyInfo] = {
     "USD": _CurrencyInfo(symbol="$", decimals=2),
@@ -781,6 +797,175 @@ def _get_daily_cost(data: dict[str, Any]) -> float | None:
     return accumulated
 
 
+def _read_access_token() -> str | None:
+    """Claude Code の認証情報から有効な access token を読み取る
+
+    期限切れの場合は None を返す
+    トークンのリフレッシュは Claude Code 本体の責務であり
+    競合を避けるためここでは行わない
+    """
+    with contextlib.suppress(OSError, json.JSONDecodeError, TypeError, ValueError):
+        oauth = json.loads(_CREDENTIALS_PATH.read_text(encoding="utf-8")).get(
+            "claudeAiOauth"
+        )
+        if not isinstance(oauth, dict):
+            return None
+
+        token = oauth.get("accessToken")
+        if not isinstance(token, str) or not token:
+            return None
+
+        expires_at = _safe_float(oauth.get("expiresAt"))
+        if expires_at is not None:
+            now_ms = datetime.now(UTC).timestamp() * 1000
+            if expires_at <= now_ms:
+                return None
+        return token
+    return None
+
+
+def _parse_iso_timestamp(value: object) -> float | None:
+    """ISO 8601 文字列を epoch 秒へ変換する(不正値は None)"""
+    if not isinstance(value, str):
+        return None
+    with contextlib.suppress(ValueError):
+        return datetime.fromisoformat(value).timestamp()
+    return None
+
+
+def _to_model_usage_entry(item: object) -> _ModelUsageEntry | None:
+    """使用量 API の limits 配列 1 要素をモデル別枠のエントリへ変換する
+
+    weekly_scoped かつ scope.model を持つ要素だけを対象とする
+    """
+    if not isinstance(item, dict) or item.get("kind") != "weekly_scoped":
+        return None
+
+    scope = item.get("scope")
+    model = scope.get("model") if isinstance(scope, dict) else None
+    name = model.get("display_name") if isinstance(model, dict) else None
+    percent = _safe_float(item.get("percent"))
+    if not isinstance(name, str) or not name or percent is None:
+        return None
+
+    return _ModelUsageEntry(
+        display_name=name,
+        percent=percent,
+        resets_at=_parse_iso_timestamp(item.get("resets_at")),
+    )
+
+
+def _fetch_model_usage() -> list[_ModelUsageEntry] | None:
+    """使用量 API からモデル別の週次枠を取得する
+
+    statusline の stdin JSON にはモデル別の枠が含まれないため
+    API から直接取得する
+    取得できない場合は None を返す
+    """
+    token = _read_access_token()
+    if token is None:
+        return None
+
+    try:
+        req = Request(
+            _USAGE_API_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urlopen(req, timeout=_API_TIMEOUT) as resp:  # noqa: S310
+            body = json.loads(resp.read().decode("utf-8"))
+    except OSError, ValueError:
+        return None
+
+    if not isinstance(body, dict):
+        return None
+
+    limits = body.get("limits")
+    if not isinstance(limits, list):
+        return []
+
+    entries: list[_ModelUsageEntry] = []
+    for item in limits:
+        entry = _to_model_usage_entry(item)
+        if entry is not None:
+            entries.append(entry)
+    return entries
+
+
+def _read_cache_obj(cache_path: Path) -> dict[str, Any]:
+    """キャッシュファイルを読み取る(存在しない・壊れている場合は空 dict)"""
+    with contextlib.suppress(OSError, json.JSONDecodeError, TypeError):
+        obj = json.loads(cache_path.read_text(encoding="utf-8"))
+        if isinstance(obj, dict):
+            return obj
+    return {}
+
+
+def _spawn_usage_refresh() -> None:
+    """使用量キャッシュを更新する子プロセスをデタッチして起動する
+
+    statusline の描画を待たせないため、結果は待たずに次回の描画へ反映する
+    """
+    kwargs: dict[str, Any] = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = (
+            subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+        )
+    else:
+        kwargs["start_new_session"] = True
+
+    with contextlib.suppress(OSError, ValueError):
+        subprocess.Popen(  # noqa: S603
+            [sys.executable, str(Path(__file__).resolve()), "--refresh-usage"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            **kwargs,
+        )
+
+
+def _get_model_usage() -> list[_ModelUsageEntry] | None:
+    """モデル別の週次枠をキャッシュから取得する
+
+    この経路では HTTP を発行しない
+    期限切れの場合は古い値を返しつつ、更新プロセスを別途起動する
+    取得に失敗し続けても再試行が過剰にならないよう試行時刻で間隔を空ける
+    """
+    cache = _read_cache_obj(_MODEL_USAGE_CACHE_PATH)
+    data = cache.get("data")
+    entries = data if isinstance(data, list) else None
+
+    now = datetime.now(UTC).timestamp()
+    cached_at = _safe_float(cache.get("_cached_at")) or 0.0
+    attempted_at = _safe_float(cache.get("_attempted_at")) or 0.0
+
+    is_fresh = entries is not None and now - cached_at < _MODEL_USAGE_TTL
+    if not is_fresh and now - attempted_at >= _MODEL_USAGE_RETRY_INTERVAL:
+        _spawn_usage_refresh()
+
+    return entries
+
+
+def _refresh_model_usage() -> None:
+    """使用量 API を取得してキャッシュを更新する(--refresh-usage 用)
+
+    取得に失敗した場合も試行時刻だけ記録し、既存データは保持する
+    API 呼び出しはロックの外で行い、ロック保持時間を最小にする
+    """
+    entries = _fetch_model_usage()
+    now = datetime.now(UTC).timestamp()
+
+    with _file_lock(_MODEL_USAGE_CACHE_PATH):
+        cache = _read_cache_obj(_MODEL_USAGE_CACHE_PATH)
+        cache["_attempted_at"] = now
+        if entries is not None:
+            cache["_cached_at"] = now
+            cache["data"] = entries
+        _write_cache(_MODEL_USAGE_CACHE_PATH, cache)
+
+
 def _seg_project(data: dict[str, Any]) -> Segment | None:
     """プロジェクト名セグメントを生成する
 
@@ -995,6 +1180,42 @@ def _seg_rate_7d(data: dict[str, Any]) -> Segment | None:
     )
 
 
+def _format_model_reset(value: object) -> str | None:
+    """モデル別枠のリセット時刻を整形する(欠損・不正値は None)"""
+    ts = _safe_float(value)
+    if ts is None or not math.isfinite(ts):
+        return None
+    with contextlib.suppress(ValueError, TypeError, OverflowError, OSError):
+        return _format_reset_date(ts)
+    return None
+
+
+def _seg_rate_model(_data: dict[str, Any]) -> Segment | None:
+    """モデル別週次レートリミットセグメントを生成する
+
+    複数のモデル枠がある場合は上限に最も近いものを表示する
+    値は stdin ではなくキャッシュから読む
+    """
+    entries = _get_model_usage()
+    if not entries:
+        return None
+
+    top = max(entries, key=lambda e: _safe_float(e.get("percent")) or 0.0)
+    pct = _safe_float(top.get("percent"))
+    name = top.get("display_name")
+    if pct is None or not math.isfinite(pct) or not isinstance(name, str):
+        return None
+
+    colored_pct = _colorize(f"{int(pct)}%", _color_for_utilization(pct))
+    # 週次枠であることを 7d セグメントと揃えるためカレンダーアイコンを使う
+    label = f"{_icons.CALENDAR} {name} {colored_pct}"
+
+    reset_str = _format_model_reset(top.get("resets_at"))
+    if reset_str is not None:
+        label = f"{label} {_icons.RESET} {reset_str}"
+    return Segment(text=label)
+
+
 def _seg_session_cost(data: dict[str, Any]) -> Segment | None:
     """セッションコストセグメントを生成する"""
     cost_val = _get_session_cost(data)
@@ -1052,12 +1273,13 @@ _SEGMENT_REGISTRY: dict[str, Callable[[dict[str, Any]], Segment | None]] = {
     "lines": _seg_lines,
     "rate_5h": _seg_rate_5h,
     "rate_7d": _seg_rate_7d,
+    "rate_model": _seg_rate_model,
     "session_cost": _seg_session_cost,
     "daily_cost": _seg_daily_cost,
 }
 
 _DEFAULT_SEGMENTS = (
-    "project,branch|model,context,rate_5h,rate_7d|session_cost,daily_cost"
+    "project,branch|model,context,rate_5h,rate_7d,rate_model|session_cost,daily_cost"
 )
 
 
@@ -1085,6 +1307,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--icons", type=str, default=None)
     parser.add_argument("--currency", type=str.upper, default=None)
     parser.add_argument("--segments", type=str, default=_DEFAULT_SEGMENTS)
+    parser.add_argument("--refresh-usage", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -1095,10 +1318,16 @@ def main() -> None:
     stdinにはプロジェクト情報やモデル情報を含むJSONが渡される
     --icons nerd を指定するとNerd Fontsアイコンを使用する
     --currency JPY を指定すると通貨を指定できる
+    --refresh-usage を指定すると表示せずに使用量キャッシュのみ更新する
     """
     global _icons, _currency  # noqa: PLW0603
 
     args = _parse_args()
+    if args.refresh_usage:
+        # バックグラウンド更新モードでは表示を行わない
+        _refresh_model_usage()
+        return
+
     _icons = _ICONS_NERD if args.icons == "nerd" else _Icons()
     _currency = _resolve_currency(args.currency)
 

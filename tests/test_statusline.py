@@ -9,7 +9,7 @@ import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Never
+from typing import TYPE_CHECKING, Any, ClassVar, Never
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -18,9 +18,7 @@ from urllib.error import URLError
 
 import pytest
 
-sys.path.insert(
-    0, str(Path(__file__).resolve().parent.parent / ".claude" / "scripts")
-)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / ".claude" / "scripts"))
 import statusline
 
 
@@ -1909,11 +1907,12 @@ class TestParseSegments:
         assert len(lines) == 1
 
     def test_default_segments_match_original(self) -> None:
-        """デフォルト文字列が旧_LINESと同じ構成を生成する"""
+        """デフォルト文字列が想定どおりの3行構成を生成する"""
         lines = statusline._parse_segments(statusline._DEFAULT_SEGMENTS)
         assert len(lines) == 3
         assert len(lines[0].segment_fns) == 2  # project, branch
-        assert len(lines[1].segment_fns) == 4  # model, context, rate_5h, rate_7d
+        # model, context, rate_5h, rate_7d, rate_model
+        assert len(lines[1].segment_fns) == 5
         assert len(lines[2].segment_fns) == 2  # session_cost, daily_cost
 
     def test_whitespace_trimmed(self) -> None:
@@ -2014,4 +2013,375 @@ class TestMain:
         ):
             mock_stdin.read.side_effect = OSError
             statusline.main()
+        assert capsys.readouterr().out == ""
+
+
+_USAGE_API_SAMPLE: dict[str, Any] = {
+    "five_hour": {"utilization": 28.0, "resets_at": "2026-08-22T07:19:59+00:00"},
+    "seven_day": {"utilization": 51.0, "resets_at": "2026-08-23T02:59:59+00:00"},
+    "seven_day_opus": None,
+    "limits": [
+        {
+            "kind": "session",
+            "group": "session",
+            "percent": 28,
+            "resets_at": "2026-08-22T07:19:59+00:00",
+            "scope": None,
+        },
+        {
+            "kind": "weekly_all",
+            "group": "weekly",
+            "percent": 51,
+            "resets_at": "2026-08-23T02:59:59+00:00",
+            "scope": None,
+        },
+        {
+            "kind": "weekly_scoped",
+            "group": "weekly",
+            "percent": 87,
+            "resets_at": "2026-08-23T02:59:59+00:00",
+            "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None},
+        },
+    ],
+}
+
+
+def _write_credentials(
+    path: Path,
+    *,
+    token: str = "tok-abc",  # noqa: S107
+    expires_in_ms: int = 3_600_000,
+) -> None:
+    """テスト用の認証情報ファイルを書き出す"""
+    expires_at = int(time.time() * 1000) + expires_in_ms
+    path.write_text(
+        json.dumps({
+            "claudeAiOauth": {
+                "accessToken": token,
+                "expiresAt": expires_at,
+                "subscriptionType": "max",
+            }
+        }),
+        encoding="utf-8",
+    )
+
+
+class TestReadAccessToken:
+    """_read_access_token のテスト"""
+
+    def test_returns_token_when_valid(self, tmp_path: Path) -> None:
+        """有効期限内のトークンを返す"""
+        creds = tmp_path / "creds.json"
+        _write_credentials(creds)
+        with patch.object(statusline, "_CREDENTIALS_PATH", creds):
+            assert statusline._read_access_token() == "tok-abc"
+
+    def test_returns_none_when_expired(self, tmp_path: Path) -> None:
+        """期限切れトークンはNoneを返す(リフレッシュは本体に任せる)"""
+        creds = tmp_path / "creds.json"
+        _write_credentials(creds, expires_in_ms=-1000)
+        with patch.object(statusline, "_CREDENTIALS_PATH", creds):
+            assert statusline._read_access_token() is None
+
+    def test_returns_none_when_file_missing(self, tmp_path: Path) -> None:
+        """認証情報ファイルがなければNoneを返す"""
+        with patch.object(statusline, "_CREDENTIALS_PATH", tmp_path / "nope.json"):
+            assert statusline._read_access_token() is None
+
+    def test_returns_none_on_invalid_json(self, tmp_path: Path) -> None:
+        """壊れたJSONではNoneを返す"""
+        creds = tmp_path / "creds.json"
+        creds.write_text("{invalid", encoding="utf-8")
+        with patch.object(statusline, "_CREDENTIALS_PATH", creds):
+            assert statusline._read_access_token() is None
+
+    def test_returns_none_without_oauth_section(self, tmp_path: Path) -> None:
+        """claudeAiOauthセクションがなければNoneを返す"""
+        creds = tmp_path / "creds.json"
+        creds.write_text(json.dumps({"mcpOAuth": {}}), encoding="utf-8")
+        with patch.object(statusline, "_CREDENTIALS_PATH", creds):
+            assert statusline._read_access_token() is None
+
+
+class TestFetchModelUsage:
+    """_fetch_model_usage のテスト"""
+
+    def _fetch_with(self, body: dict[str, Any]) -> Any:  # noqa: ANN401
+        """指定レスポンスをモックして取得を実行する"""
+        with (
+            patch.object(statusline, "_read_access_token", return_value="tok"),
+            patch(
+                "statusline.urlopen",
+                return_value=_mock_http_response(json.dumps(body).encode()),
+            ),
+        ):
+            return statusline._fetch_model_usage()
+
+    def test_projects_weekly_scoped_entries(self) -> None:
+        """weekly_scopedのモデル別枠を射影する"""
+        result = self._fetch_with(_USAGE_API_SAMPLE)
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["display_name"] == "Fable"
+        assert result[0]["percent"] == 87
+
+    def test_excludes_other_kinds(self) -> None:
+        """種別が session や weekly_all の要素は対象外とする"""
+        result = self._fetch_with(_USAGE_API_SAMPLE)
+        assert result is not None
+        assert all(e["display_name"] == "Fable" for e in result)
+
+    def test_excludes_entries_without_model_scope(self) -> None:
+        """scope.model を持たないweekly_scopedは除外する"""
+        body: dict[str, Any] = {
+            "limits": [
+                {
+                    "kind": "weekly_scoped",
+                    "percent": 10,
+                    "resets_at": None,
+                    "scope": {"model": None, "surface": {"display_name": "Cowork"}},
+                }
+            ]
+        }
+        assert self._fetch_with(body) == []
+
+    def test_converts_resets_at_to_epoch(self) -> None:
+        """resets_atをepoch秒に変換する"""
+        result = self._fetch_with(_USAGE_API_SAMPLE)
+        assert result is not None
+        expected = datetime(2026, 8, 23, 2, 59, 59, tzinfo=UTC).timestamp()
+        assert result[0]["resets_at"] == pytest.approx(expected)  # pyright: ignore[reportUnknownMemberType]
+
+    def test_keeps_entry_with_null_resets_at(self) -> None:
+        """resets_atがnullでもエントリを残す"""
+        body: dict[str, Any] = {
+            "limits": [
+                {
+                    "kind": "weekly_scoped",
+                    "percent": 5,
+                    "resets_at": None,
+                    "scope": {"model": {"display_name": "Fable"}},
+                }
+            ]
+        }
+        result = self._fetch_with(body)
+        assert result is not None
+        assert result[0]["resets_at"] is None
+
+    def test_returns_empty_list_without_limits(self) -> None:
+        """limitsがないレスポンスは空リストを返す"""
+        assert self._fetch_with({"five_hour": None}) == []
+
+    def test_returns_none_without_token(self) -> None:
+        """トークンがない場合はHTTPを発行せずNoneを返す"""
+        with (
+            patch.object(statusline, "_read_access_token", return_value=None),
+            patch("statusline.urlopen") as mock_urlopen,
+        ):
+            assert statusline._fetch_model_usage() is None
+        mock_urlopen.assert_not_called()
+
+    def test_returns_none_on_http_error(self) -> None:
+        """HTTP失敗時はNoneを返す"""
+        with (
+            patch.object(statusline, "_read_access_token", return_value="tok"),
+            patch("statusline.urlopen", side_effect=URLError("boom")),
+        ):
+            assert statusline._fetch_model_usage() is None
+
+
+class TestGetModelUsage:
+    """_get_model_usage のテスト"""
+
+    _ENTRY: ClassVar[dict[str, Any]] = {
+        "display_name": "Fable",
+        "percent": 87,
+        "resets_at": None,
+    }
+
+    def _write_cache(
+        self, path: Path, *, cached_at: float, attempted_at: float
+    ) -> None:
+        """テスト用のキャッシュファイルを書き出す"""
+        path.write_text(
+            json.dumps({
+                "_cached_at": cached_at,
+                "_attempted_at": attempted_at,
+                "data": [self._ENTRY],
+            }),
+            encoding="utf-8",
+        )
+
+    def test_returns_cached_data_within_ttl_without_spawn(self, tmp_path: Path) -> None:
+        """TTL内はキャッシュを返し更新プロセスを起動しない"""
+        cache = tmp_path / "usage.json"
+        now = time.time()
+        self._write_cache(cache, cached_at=now, attempted_at=now)
+        with (
+            patch.object(statusline, "_MODEL_USAGE_CACHE_PATH", cache),
+            patch.object(statusline, "_spawn_usage_refresh") as spawn,
+        ):
+            result = statusline._get_model_usage()
+        assert result == [self._ENTRY]
+        spawn.assert_not_called()
+
+    def test_returns_expired_data_and_spawns(self, tmp_path: Path) -> None:
+        """TTL切れでは期限切れデータを返しつつ更新を起動する"""
+        cache = tmp_path / "usage.json"
+        old = time.time() - 10_000
+        self._write_cache(cache, cached_at=old, attempted_at=old)
+        with (
+            patch.object(statusline, "_MODEL_USAGE_CACHE_PATH", cache),
+            patch.object(statusline, "_spawn_usage_refresh") as spawn,
+        ):
+            result = statusline._get_model_usage()
+        assert result == [self._ENTRY]
+        spawn.assert_called_once()
+
+    def test_does_not_spawn_within_retry_interval(self, tmp_path: Path) -> None:
+        """直近に試行済みなら再試行を起動しない"""
+        cache = tmp_path / "usage.json"
+        self._write_cache(
+            cache, cached_at=time.time() - 10_000, attempted_at=time.time()
+        )
+        with (
+            patch.object(statusline, "_MODEL_USAGE_CACHE_PATH", cache),
+            patch.object(statusline, "_spawn_usage_refresh") as spawn,
+        ):
+            statusline._get_model_usage()
+        spawn.assert_not_called()
+
+    def test_spawns_and_returns_none_without_cache(self, tmp_path: Path) -> None:
+        """キャッシュがなければNoneを返して更新を起動する"""
+        with (
+            patch.object(
+                statusline, "_MODEL_USAGE_CACHE_PATH", tmp_path / "absent.json"
+            ),
+            patch.object(statusline, "_spawn_usage_refresh") as spawn,
+        ):
+            assert statusline._get_model_usage() is None
+        spawn.assert_called_once()
+
+    def test_never_performs_http_request(self, tmp_path: Path) -> None:
+        """表示経路ではHTTPを発行しない"""
+        with (
+            patch.object(
+                statusline, "_MODEL_USAGE_CACHE_PATH", tmp_path / "absent.json"
+            ),
+            patch.object(statusline, "_spawn_usage_refresh"),
+            patch("statusline.urlopen") as mock_urlopen,
+        ):
+            statusline._get_model_usage()
+        mock_urlopen.assert_not_called()
+
+
+class TestRefreshModelUsage:
+    """_refresh_model_usage のテスト"""
+
+    _ENTRY: ClassVar[dict[str, Any]] = {
+        "display_name": "Fable",
+        "percent": 87,
+        "resets_at": None,
+    }
+
+    def test_writes_data_on_success(self, tmp_path: Path) -> None:
+        """取得成功時にデータと取得時刻を書き込む"""
+        cache = tmp_path / "usage.json"
+        with (
+            patch.object(statusline, "_MODEL_USAGE_CACHE_PATH", cache),
+            patch.object(statusline, "_fetch_model_usage", return_value=[self._ENTRY]),
+        ):
+            statusline._refresh_model_usage()
+        obj = json.loads(cache.read_text(encoding="utf-8"))
+        assert obj["data"] == [self._ENTRY]
+        assert obj["_cached_at"] > 0
+        assert obj["_attempted_at"] > 0
+
+    def test_keeps_previous_data_on_failure(self, tmp_path: Path) -> None:
+        """取得失敗時も既存データを保持し試行時刻のみ更新する"""
+        cache = tmp_path / "usage.json"
+        cache.write_text(
+            json.dumps({
+                "_cached_at": 100.0,
+                "_attempted_at": 100.0,
+                "data": [self._ENTRY],
+            }),
+            encoding="utf-8",
+        )
+        with (
+            patch.object(statusline, "_MODEL_USAGE_CACHE_PATH", cache),
+            patch.object(statusline, "_fetch_model_usage", return_value=None),
+        ):
+            statusline._refresh_model_usage()
+        obj = json.loads(cache.read_text(encoding="utf-8"))
+        assert obj["data"] == [self._ENTRY]
+        assert obj["_cached_at"] == 100.0
+        assert obj["_attempted_at"] > 100.0
+
+
+class TestSegRateModel:
+    """_seg_rate_model のテスト"""
+
+    def _seg_with(self, entries: list[dict[str, Any]] | None) -> Any:  # noqa: ANN401
+        """指定エントリでセグメントを生成する"""
+        with patch.object(statusline, "_get_model_usage", return_value=entries):
+            return statusline._seg_rate_model({})
+
+    def test_renders_display_name_and_percent(self) -> None:
+        """モデル名と利用率を表示する"""
+        reset = datetime(2026, 8, 23, 2, 59, tzinfo=UTC).timestamp()
+        seg = self._seg_with([
+            {"display_name": "Fable", "percent": 87, "resets_at": reset}
+        ])
+        assert seg is not None
+        assert "Fable" in seg.text
+        assert "87%" in seg.text
+        assert statusline._format_reset_date(reset) in seg.text
+
+    def test_returns_none_without_data(self) -> None:
+        """データがなければセグメントを出さない"""
+        assert self._seg_with(None) is None
+        assert self._seg_with([]) is None
+
+    def test_selects_highest_percent(self) -> None:
+        """複数枠では利用率が最も高いものを表示する"""
+        seg = self._seg_with([
+            {"display_name": "Sonnet", "percent": 10, "resets_at": None},
+            {"display_name": "Fable", "percent": 87, "resets_at": None},
+        ])
+        assert seg is not None
+        assert "Fable" in seg.text
+        assert "Sonnet" not in seg.text
+
+    def test_omits_reset_when_missing(self) -> None:
+        """resets_atがなければリセット表示を省く"""
+        seg = self._seg_with([
+            {"display_name": "Fable", "percent": 5, "resets_at": None}
+        ])
+        assert seg is not None
+        assert "Fable" in seg.text
+        assert statusline._icons.RESET not in seg.text
+
+    def test_colors_by_utilization(self) -> None:
+        """利用率に応じた色を適用する"""
+        seg = self._seg_with([
+            {"display_name": "Fable", "percent": 87, "resets_at": None}
+        ])
+        assert seg is not None
+        assert str(int(statusline._Color.RED)) in seg.text
+
+
+class TestMainRefreshUsage:
+    """main() の --refresh-usage 分岐のテスト"""
+
+    def test_refresh_flag_skips_stdin(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """--refresh-usage ではstdinを読まず更新のみ行う"""
+        with (
+            patch("sys.argv", ["statusline.py", "--refresh-usage"]),
+            patch("sys.stdin") as mock_stdin,
+            patch.object(statusline, "_refresh_model_usage") as refresh,
+        ):
+            statusline.main()
+        refresh.assert_called_once()
+        mock_stdin.read.assert_not_called()
         assert capsys.readouterr().out == ""
