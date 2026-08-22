@@ -1135,7 +1135,10 @@ def _seg_rate_common(
     icon: str,
     fmt_reset: Callable[[int | float], str],
 ) -> Segment | None:
-    """レートリミットセグメントの共通生成ロジック"""
+    """レートリミットセグメントの共通生成ロジック
+
+    週次枠にはモデル別の内訳を括弧で併記する
+    """
     usage = data.get("rate_limits")
     if not isinstance(usage, dict):
         return None
@@ -1162,7 +1165,11 @@ def _seg_rate_common(
 
     pct_str = f"{int(pct_val)}%"
     colored_pct = _colorize(pct_str, color)
-    label = f"{icon} {period_label} {colored_pct} {_icons.RESET} {reset_str}"
+    # モデル別の枠は週次にのみ存在するため 7d だけ内訳を併記する
+    pct_suffix = _model_usage_suffix() if usage_key == "seven_day" else ""
+    label = (
+        f"{icon} {period_label} {colored_pct}{pct_suffix} {_icons.RESET} {reset_str}"
+    )
     return Segment(text=label)
 
 
@@ -1174,46 +1181,31 @@ def _seg_rate_5h(data: dict[str, Any]) -> Segment | None:
 
 
 def _seg_rate_7d(data: dict[str, Any]) -> Segment | None:
-    """7日間レートリミットセグメントを生成する"""
+    """7日間レートリミットセグメントを生成する
+
+    モデル別の週次枠が取得できていれば括弧内へ併記する
+    """
     return _seg_rate_common(
         data, "seven_day", "7d", _icons.CALENDAR, _format_reset_date
     )
 
 
-def _format_model_reset(value: object) -> str | None:
-    """モデル別枠のリセット時刻を整形する(欠損・不正値は None)"""
-    ts = _safe_float(value)
-    if ts is None or not math.isfinite(ts):
-        return None
-    with contextlib.suppress(ValueError, TypeError, OverflowError, OSError):
-        return _format_reset_date(ts)
-    return None
+def _model_usage_suffix() -> str:
+    """モデル別週次枠を 7d セグメントへ併記する括弧表記を返す
 
-
-def _seg_rate_model(_data: dict[str, Any]) -> Segment | None:
-    """モデル別週次レートリミットセグメントを生成する
-
-    複数のモデル枠がある場合は上限に最も近いものを表示する
-    値は stdin ではなくキャッシュから読む
+    複数のモデル枠がある場合は上限に最も近いものを採用する
+    取得できていない場合は空文字を返し、括弧自体を出さない
     """
     entries = _get_model_usage()
     if not entries:
-        return None
+        return ""
 
     top = max(entries, key=lambda e: _safe_float(e.get("percent")) or 0.0)
     pct = _safe_float(top.get("percent"))
-    name = top.get("display_name")
-    if pct is None or not math.isfinite(pct) or not isinstance(name, str):
-        return None
+    if pct is None or not math.isfinite(pct):
+        return ""
 
-    colored_pct = _colorize(f"{int(pct)}%", _color_for_utilization(pct))
-    # 週次枠であることを 7d セグメントと揃えるためカレンダーアイコンを使う
-    label = f"{_icons.CALENDAR} {name} {colored_pct}"
-
-    reset_str = _format_model_reset(top.get("resets_at"))
-    if reset_str is not None:
-        label = f"{label} {_icons.RESET} {reset_str}"
-    return Segment(text=label)
+    return f"({_colorize(f'{int(pct)}%', _color_for_utilization(pct))})"
 
 
 def _seg_session_cost(data: dict[str, Any]) -> Segment | None:
@@ -1273,13 +1265,12 @@ _SEGMENT_REGISTRY: dict[str, Callable[[dict[str, Any]], Segment | None]] = {
     "lines": _seg_lines,
     "rate_5h": _seg_rate_5h,
     "rate_7d": _seg_rate_7d,
-    "rate_model": _seg_rate_model,
     "session_cost": _seg_session_cost,
     "daily_cost": _seg_daily_cost,
 }
 
 _DEFAULT_SEGMENTS = (
-    "project,branch|model,context,rate_5h,rate_7d,rate_model|session_cost,daily_cost"
+    "project,branch|model,context,rate_5h,rate_7d|session_cost,daily_cost"
 )
 
 

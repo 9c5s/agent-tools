@@ -31,6 +31,22 @@ def _mock_http_response(body: bytes) -> MagicMock:
     return mock_resp
 
 
+@pytest.fixture(autouse=True)
+def _isolate_model_usage(  # pyright: ignore[reportUnusedFunction]
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[None]:
+    """モデル別使用量を実キャッシュと子プロセスから隔離する
+
+    既定では未取得の状態にし、必要なテストが個別に上書きする
+    """
+    absent = tmp_path_factory.mktemp("model-usage") / "absent.json"
+    with (
+        patch.object(statusline, "_MODEL_USAGE_CACHE_PATH", absent),
+        patch.object(statusline, "_spawn_usage_refresh"),
+    ):
+        yield
+
+
 _FULL_STDIN_SAMPLE: dict[str, Any] = {
     "cwd": "/fallback/cwd/directory",
     "session_id": "abc123...",
@@ -1911,8 +1927,7 @@ class TestParseSegments:
         lines = statusline._parse_segments(statusline._DEFAULT_SEGMENTS)
         assert len(lines) == 3
         assert len(lines[0].segment_fns) == 2  # project, branch
-        # model, context, rate_5h, rate_7d, rate_model
-        assert len(lines[1].segment_fns) == 5
+        assert len(lines[1].segment_fns) == 4  # model, context, rate_5h, rate_7d
         assert len(lines[2].segment_fns) == 2  # session_cost, daily_cost
 
     def test_whitespace_trimmed(self) -> None:
@@ -2319,56 +2334,77 @@ class TestRefreshModelUsage:
         assert obj["_attempted_at"] > 100.0
 
 
-class TestSegRateModel:
-    """_seg_rate_model のテスト"""
+class TestSegRate7dModelUsage:
+    """_seg_rate_7d のモデル別枠併記のテスト"""
+
+    _DATA: ClassVar[dict[str, Any]] = {
+        "rate_limits": {"seven_day": {"used_percentage": 51, "resets_at": 1787454000}}
+    }
 
     def _seg_with(self, entries: list[dict[str, Any]] | None) -> Any:  # noqa: ANN401
-        """指定エントリでセグメントを生成する"""
+        """指定のモデル別枠でセグメントを生成する"""
         with patch.object(statusline, "_get_model_usage", return_value=entries):
-            return statusline._seg_rate_model({})
+            return statusline._seg_rate_7d(self._DATA)
 
-    def test_renders_display_name_and_percent(self) -> None:
-        """モデル名と利用率を表示する"""
-        reset = datetime(2026, 8, 23, 2, 59, tzinfo=UTC).timestamp()
+    def test_appends_model_percent_in_parentheses(self) -> None:
+        """モデル別枠を利用率の直後へ括弧で併記する"""
         seg = self._seg_with([
-            {"display_name": "Fable", "percent": 87, "resets_at": reset}
+            {"display_name": "Fable", "percent": 88, "resets_at": None}
         ])
         assert seg is not None
-        assert "Fable" in seg.text
-        assert "87%" in seg.text
-        assert statusline._format_reset_date(reset) in seg.text
+        assert "51%" in seg.text
+        assert "88%" in seg.text
+        assert "(" in seg.text
 
-    def test_returns_none_without_data(self) -> None:
-        """データがなければセグメントを出さない"""
-        assert self._seg_with(None) is None
-        assert self._seg_with([]) is None
+    def test_omits_parentheses_without_model_usage(self) -> None:
+        """モデル別枠がなければ括弧を出さない"""
+        seg = self._seg_with(None)
+        assert seg is not None
+        assert "51%" in seg.text
+        assert "(" not in seg.text
 
     def test_selects_highest_percent(self) -> None:
-        """複数枠では利用率が最も高いものを表示する"""
+        """複数枠では利用率が最も高いものを併記する"""
         seg = self._seg_with([
             {"display_name": "Sonnet", "percent": 10, "resets_at": None},
-            {"display_name": "Fable", "percent": 87, "resets_at": None},
+            {"display_name": "Fable", "percent": 88, "resets_at": None},
         ])
         assert seg is not None
-        assert "Fable" in seg.text
-        assert "Sonnet" not in seg.text
+        assert "88%" in seg.text
+        assert "10%" not in seg.text
 
-    def test_omits_reset_when_missing(self) -> None:
-        """resets_atがなければリセット表示を省く"""
+    def test_colors_each_percent_independently(self) -> None:
+        """本体と併記部分をそれぞれの利用率で色付けする"""
         seg = self._seg_with([
-            {"display_name": "Fable", "percent": 5, "resets_at": None}
+            {"display_name": "Fable", "percent": 88, "resets_at": None}
         ])
         assert seg is not None
-        assert "Fable" in seg.text
-        assert statusline._icons.RESET not in seg.text
-
-    def test_colors_by_utilization(self) -> None:
-        """利用率に応じた色を適用する"""
-        seg = self._seg_with([
-            {"display_name": "Fable", "percent": 87, "resets_at": None}
-        ])
-        assert seg is not None
+        assert str(int(statusline._Color.GREEN)) in seg.text
         assert str(int(statusline._Color.RED)) in seg.text
+
+    def test_ignores_invalid_percent(self) -> None:
+        """利用率が不正な枠は併記しない"""
+        seg = self._seg_with([
+            {"display_name": "Fable", "percent": None, "resets_at": None}
+        ])
+        assert seg is not None
+        assert "(" not in seg.text
+
+    def test_does_not_affect_5h_segment(self) -> None:
+        """5h セグメントには併記しない"""
+        data: dict[str, Any] = {
+            "rate_limits": {
+                "five_hour": {"used_percentage": 32, "resets_at": 1787383200}
+            }
+        }
+        with patch.object(
+            statusline,
+            "_get_model_usage",
+            return_value=[{"display_name": "Fable", "percent": 88, "resets_at": None}],
+        ):
+            seg = statusline._seg_rate_5h(data)
+        assert seg is not None
+        assert "(" not in seg.text
 
 
 class TestMainRefreshUsage:
