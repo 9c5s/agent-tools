@@ -2119,10 +2119,10 @@ class TestReadAccessToken:
 
 
 class TestFetchModelUsage:
-    """_fetch_model_usage のテスト"""
+    """_fetch_usage_snapshot のテスト"""
 
-    def _fetch_with(self, body: dict[str, Any]) -> Any:  # noqa: ANN401
-        """指定レスポンスをモックして取得を実行する"""
+    def _snapshot_with(self, body: dict[str, Any]) -> Any:  # noqa: ANN401
+        """指定レスポンスをモックしてスナップショットを取得する"""
         with (
             patch.object(statusline, "_read_access_token", return_value="tok"),
             patch(
@@ -2130,7 +2130,46 @@ class TestFetchModelUsage:
                 return_value=_mock_http_response(json.dumps(body).encode()),
             ),
         ):
-            return statusline._fetch_model_usage()
+            return statusline._fetch_usage_snapshot()
+
+    def _fetch_with(self, body: dict[str, Any]) -> Any:  # noqa: ANN401
+        """指定レスポンスをモックしてモデル別枠だけを取り出す"""
+        snapshot = self._snapshot_with(body)
+        return None if snapshot is None else snapshot["model_scoped"]
+
+    def test_extracts_weekly_all_bucket(self) -> None:
+        """weekly_all を 7d 全体のバケットとして取り出す"""
+        snapshot = self._snapshot_with(_USAGE_API_SAMPLE)
+        assert snapshot is not None
+        assert snapshot["weekly"] == {
+            "used_percentage": 51,
+            "resets_at": datetime(2026, 8, 23, 2, 59, 59, tzinfo=UTC).timestamp(),
+        }
+
+    def test_weekly_is_none_without_weekly_all(self) -> None:
+        """weekly_all が無ければ 7d 全体は None になる"""
+        body: dict[str, Any] = {
+            "limits": [
+                {
+                    "kind": "weekly_scoped",
+                    "percent": 5,
+                    "resets_at": None,
+                    "scope": {"model": {"display_name": "Fable"}},
+                }
+            ]
+        }
+        snapshot = self._snapshot_with(body)
+        assert snapshot is not None
+        assert snapshot["weekly"] is None
+
+    def test_weekly_is_none_without_reset_time(self) -> None:
+        """リセット時刻が無い weekly_all は採用しない"""
+        body: dict[str, Any] = {
+            "limits": [{"kind": "weekly_all", "percent": 51, "resets_at": None}]
+        }
+        snapshot = self._snapshot_with(body)
+        assert snapshot is not None
+        assert snapshot["weekly"] is None
 
     def test_projects_weekly_scoped_entries(self) -> None:
         """weekly_scopedのモデル別枠を射影する"""
@@ -2193,7 +2232,7 @@ class TestFetchModelUsage:
             patch.object(statusline, "_read_access_token", return_value=None),
             patch("statusline.urlopen") as mock_urlopen,
         ):
-            assert statusline._fetch_model_usage() is None
+            assert statusline._fetch_usage_snapshot() is None
         mock_urlopen.assert_not_called()
 
     def test_returns_none_on_http_error(self) -> None:
@@ -2202,7 +2241,7 @@ class TestFetchModelUsage:
             patch.object(statusline, "_read_access_token", return_value="tok"),
             patch("statusline.urlopen", side_effect=URLError("boom")),
         ):
-            assert statusline._fetch_model_usage() is None
+            assert statusline._fetch_usage_snapshot() is None
 
 
 class TestGetModelUsage:
@@ -2298,17 +2337,23 @@ class TestRefreshModelUsage:
         "percent": 87,
         "resets_at": None,
     }
+    _WEEKLY: ClassVar[dict[str, Any]] = {
+        "used_percentage": 51,
+        "resets_at": 1787454000,
+    }
 
     def test_writes_data_on_success(self, tmp_path: Path) -> None:
-        """取得成功時にデータと取得時刻を書き込む"""
+        """取得成功時に週次値とモデル別枠と取得時刻を書き込む"""
         cache = tmp_path / "usage.json"
+        snapshot = {"weekly": self._WEEKLY, "model_scoped": [self._ENTRY]}
         with (
             patch.object(statusline, "_MODEL_USAGE_CACHE_PATH", cache),
-            patch.object(statusline, "_fetch_model_usage", return_value=[self._ENTRY]),
+            patch.object(statusline, "_fetch_usage_snapshot", return_value=snapshot),
         ):
             statusline._refresh_model_usage()
         obj = json.loads(cache.read_text(encoding="utf-8"))
         assert obj["data"] == [self._ENTRY]
+        assert obj["weekly"] == self._WEEKLY
         assert obj["_cached_at"] > 0
         assert obj["_attempted_at"] > 0
 
@@ -2320,18 +2365,67 @@ class TestRefreshModelUsage:
                 "_cached_at": 100.0,
                 "_attempted_at": 100.0,
                 "data": [self._ENTRY],
+                "weekly": self._WEEKLY,
             }),
             encoding="utf-8",
         )
         with (
             patch.object(statusline, "_MODEL_USAGE_CACHE_PATH", cache),
-            patch.object(statusline, "_fetch_model_usage", return_value=None),
+            patch.object(statusline, "_fetch_usage_snapshot", return_value=None),
         ):
             statusline._refresh_model_usage()
         obj = json.loads(cache.read_text(encoding="utf-8"))
         assert obj["data"] == [self._ENTRY]
+        assert obj["weekly"] == self._WEEKLY
         assert obj["_cached_at"] == 100.0
         assert obj["_attempted_at"] > 100.0
+
+
+class TestWithCachedWeekly:
+    """_with_cached_weekly のテスト"""
+
+    _WEEKLY: ClassVar[dict[str, Any]] = {
+        "used_percentage": 51,
+        "resets_at": 1787454000,
+    }
+    _DATA: ClassVar[dict[str, Any]] = {
+        "rate_limits": {
+            "five_hour": {"used_percentage": 30, "resets_at": 1787383200},
+            "seven_day": {"used_percentage": 99, "resets_at": 1},
+        }
+    }
+
+    def _apply(self, cache_obj: dict[str, Any] | None, tmp_path: Path) -> Any:  # noqa: ANN401
+        """指定キャッシュ内容で差し替えを実行する"""
+        cache = tmp_path / "usage.json"
+        if cache_obj is not None:
+            cache.write_text(json.dumps(cache_obj), encoding="utf-8")
+        with patch.object(statusline, "_MODEL_USAGE_CACHE_PATH", cache):
+            return statusline._with_cached_weekly(self._DATA)
+
+    def test_replaces_seven_day_with_cached_value(self, tmp_path: Path) -> None:
+        """キャッシュの週次値で seven_day を差し替える"""
+        got = self._apply({"weekly": self._WEEKLY}, tmp_path)
+        assert got["rate_limits"]["seven_day"] == self._WEEKLY
+
+    def test_keeps_five_hour_untouched(self, tmp_path: Path) -> None:
+        """5h は差し替えない"""
+        got = self._apply({"weekly": self._WEEKLY}, tmp_path)
+        assert got["rate_limits"]["five_hour"] == self._DATA["rate_limits"]["five_hour"]
+
+    def test_returns_original_without_cache(self, tmp_path: Path) -> None:
+        """キャッシュが無ければ元の data を返す"""
+        assert self._apply(None, tmp_path) == self._DATA
+
+    def test_returns_original_when_weekly_invalid(self, tmp_path: Path) -> None:
+        """週次値が不正なら元の data を返す"""
+        got = self._apply({"weekly": {"used_percentage": None}}, tmp_path)
+        assert got == self._DATA
+
+    def test_does_not_mutate_input(self, tmp_path: Path) -> None:
+        """元の data を書き換えない"""
+        self._apply({"weekly": self._WEEKLY}, tmp_path)
+        assert self._DATA["rate_limits"]["seven_day"]["used_percentage"] == 99
 
 
 class TestSegRate7dModelUsage:
@@ -2389,6 +2483,22 @@ class TestSegRate7dModelUsage:
         ])
         assert seg is not None
         assert "(" not in seg.text
+
+    def test_uses_cached_weekly_for_base_value(self, tmp_path: Path) -> None:
+        """通常値もキャッシュの週次値を使う(内訳と表示時点を揃えるため)"""
+        cache = tmp_path / "usage.json"
+        cache.write_text(
+            json.dumps({"weekly": {"used_percentage": 60, "resets_at": 1787454000}}),
+            encoding="utf-8",
+        )
+        with (
+            patch.object(statusline, "_MODEL_USAGE_CACHE_PATH", cache),
+            patch.object(statusline, "_get_model_usage", return_value=None),
+        ):
+            seg = statusline._seg_rate_7d(self._DATA)
+        assert seg is not None
+        assert "60%" in seg.text
+        assert "51%" not in seg.text
 
     def test_does_not_affect_5h_segment(self) -> None:
         """5h セグメントには併記しない"""
