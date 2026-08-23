@@ -106,6 +106,16 @@ class _RateLimitsInput(TypedDict, total=False):
     seven_day: _RateBucketInput
 
 
+class _UsageSnapshot(TypedDict):
+    """使用量 API から一度に取り出した週次の使用状況
+
+    7d 全体とモデル別枠を同じ応答から取ることで表示時点を揃える
+    """
+
+    weekly: _RateBucketInput | None
+    model_scoped: list[_ModelUsageEntry]
+
+
 class _ModelUsageEntry(TypedDict):
     """使用量 API から射影したモデル別週次枠
 
@@ -855,11 +865,29 @@ def _to_model_usage_entry(item: object) -> _ModelUsageEntry | None:
     )
 
 
-def _fetch_model_usage() -> list[_ModelUsageEntry] | None:
-    """使用量 API からモデル別の週次枠を取得する
+def _to_weekly_bucket(item: object) -> _RateBucketInput | None:
+    """使用量 API の limits 配列 1 要素を週次全体のバケットへ変換する
+
+    kind が weekly_all の要素だけを対象とする
+    リセット時刻が無い要素は表示できないため除外する
+    """
+    if not isinstance(item, dict) or item.get("kind") != "weekly_all":
+        return None
+
+    percent = _safe_float(item.get("percent"))
+    ts = _parse_iso_timestamp(item.get("resets_at"))
+    if percent is None or ts is None:
+        return None
+
+    return _RateBucketInput(used_percentage=percent, resets_at=ts)
+
+
+def _fetch_usage_snapshot() -> _UsageSnapshot | None:
+    """使用量 API から週次の使用状況を取得する
 
     statusline の stdin JSON にはモデル別の枠が含まれないため
     API から直接取得する
+    7d 全体も同じ応答から取り出し、括弧内の内訳と表示時点を揃える
     取得できない場合は None を返す
     """
     token = _read_access_token()
@@ -884,14 +912,17 @@ def _fetch_model_usage() -> list[_ModelUsageEntry] | None:
 
     limits = body.get("limits")
     if not isinstance(limits, list):
-        return []
+        return _UsageSnapshot(weekly=None, model_scoped=[])
 
+    weekly: _RateBucketInput | None = None
     entries: list[_ModelUsageEntry] = []
     for item in limits:
         entry = _to_model_usage_entry(item)
         if entry is not None:
             entries.append(entry)
-    return entries
+        elif weekly is None:
+            weekly = _to_weekly_bucket(item)
+    return _UsageSnapshot(weekly=weekly, model_scoped=entries)
 
 
 def _read_cache_obj(cache_path: Path) -> dict[str, Any]:
@@ -948,21 +979,45 @@ def _get_model_usage() -> list[_ModelUsageEntry] | None:
     return entries
 
 
+def _cached_weekly_bucket() -> dict[str, Any] | None:
+    """使用量キャッシュの週次バケットを返す(無ければ None)"""
+    weekly = _read_cache_obj(_MODEL_USAGE_CACHE_PATH).get("weekly")
+    if not isinstance(weekly, dict):
+        return None
+    if _safe_float(weekly.get("used_percentage")) is None:
+        return None
+    return weekly
+
+
+def _with_cached_weekly(data: dict[str, Any]) -> dict[str, Any]:
+    """rate_limits.seven_day を使用量キャッシュの週次値へ差し替える
+
+    括弧内のモデル別枠と同じ取得時点の値を並べるためである
+    キャッシュに週次の値が無ければ元の data をそのまま返す
+    """
+    weekly = _cached_weekly_bucket()
+    usage = data.get("rate_limits")
+    if weekly is None or not isinstance(usage, dict):
+        return data
+    return {**data, "rate_limits": {**usage, "seven_day": weekly}}
+
+
 def _refresh_model_usage() -> None:
     """使用量 API を取得してキャッシュを更新する(--refresh-usage 用)
 
     取得に失敗した場合も試行時刻だけ記録し、既存データは保持する
     API 呼び出しはロックの外で行い、ロック保持時間を最小にする
     """
-    entries = _fetch_model_usage()
+    snapshot = _fetch_usage_snapshot()
     now = datetime.now(UTC).timestamp()
 
     with _file_lock(_MODEL_USAGE_CACHE_PATH):
         cache = _read_cache_obj(_MODEL_USAGE_CACHE_PATH)
         cache["_attempted_at"] = now
-        if entries is not None:
+        if snapshot is not None:
             cache["_cached_at"] = now
-            cache["data"] = entries
+            cache["data"] = snapshot["model_scoped"]
+            cache["weekly"] = snapshot["weekly"]
         _write_cache(_MODEL_USAGE_CACHE_PATH, cache)
 
 
@@ -1184,9 +1239,14 @@ def _seg_rate_7d(data: dict[str, Any]) -> Segment | None:
     """7日間レートリミットセグメントを生成する
 
     モデル別の週次枠が取得できていれば括弧内へ併記する
+    内訳と表示時点を揃えるため、通常値も使用量キャッシュがあればそちらを使う
     """
     return _seg_rate_common(
-        data, "seven_day", "7d", _icons.CALENDAR, _format_reset_date
+        _with_cached_weekly(data),
+        "seven_day",
+        "7d",
+        _icons.CALENDAR,
+        _format_reset_date,
     )
 
 
