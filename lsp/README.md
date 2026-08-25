@@ -35,6 +35,8 @@ Claude Code --spawn--> node proxy.mjs <実体コマンド> [引数...]
 npm install -g typescript-language-server typescript
 ```
 
+対象ワークスペースには tsserver.js を同梱する TypeScript 5 系を導入する (`npm install -D typescript@5`)。TypeScript 7 系はネイティブ実装で tsserver.js を同梱しないため、typescript-language-server の初期化が失敗する。
+
 Claude Code の TUI 上で以下を実行:
 
 ```
