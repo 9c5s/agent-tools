@@ -27,15 +27,30 @@ Claude Code --spawn--> node proxy.mjs <実体コマンド> [引数...]
 
 依存パッケージはなく、Node.js のみで動作する。
 
+## 対応言語
+
+| 言語 | 言語サーバー | 対象拡張子 |
+|---|---|---|
+| TypeScript / JavaScript | typescript-language-server | `.ts` `.tsx` `.js` `.jsx` `.mts` `.cts` `.mjs` `.cjs` |
+| Python | pyright | `.py` `.pyi` |
+
 ## インストール
 
-言語サーバー本体は公式プラグインと同様に別途導入しておく。
+言語サーバー本体は公式プラグインと同様に別途導入しておく。利用する言語のものだけでよい。
+
+**TypeScript / JavaScript**
 
 ```
 npm install -g typescript-language-server typescript
 ```
 
 対象ワークスペースには tsserver.js を同梱する TypeScript 5 系を導入する (`npm install -D typescript@5`)。TypeScript 7 系はネイティブ実装で tsserver.js を同梱しないため、typescript-language-server の初期化が失敗する。
+
+**Python**
+
+```
+npm install -g pyright
+```
 
 Claude Code の TUI 上で以下を実行:
 
@@ -49,10 +64,10 @@ Claude Code の TUI 上で以下を実行:
 `.claude-plugin/plugin.json` の `lspServers` に、[公式マーケットプレイス](https://github.com/anthropics/claude-plugins-official) の該当言語の定義を写し、`command` / `args` をプロキシ経由に書き換えて追記する。
 
 ```jsonc
-"pyright": {
+"gopls": {
   "command": "node",
-  "args": ["${CLAUDE_PLUGIN_ROOT}/proxy.mjs", "pyright-langserver", "--stdio"],
-  "extensionToLanguage": { ".py": "python", ".pyi": "python" }
+  "args": ["${CLAUDE_PLUGIN_ROOT}/proxy.mjs", "gopls"],
+  "extensionToLanguage": { ".go": "go" }
 }
 ```
 
