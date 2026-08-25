@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "lsp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": { "name": "9c5s" },
   "description": "Windows 上の Claude Code で LSP サーバーとの通信を修復する透過プロキシ経由の LSP 統合",
   "lspServers": {
@@ -33,6 +33,124 @@
       "extensionToLanguage": {
         ".py": "python",
         ".pyi": "python"
+      }
+    },
+    "clangd": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/proxy.mjs",
+        "clangd",
+        "--background-index"
+      ],
+      "extensionToLanguage": {
+        ".c": "c",
+        ".h": "c",
+        ".cpp": "cpp",
+        ".cc": "cpp",
+        ".cxx": "cpp",
+        ".hpp": "cpp",
+        ".hxx": "cpp",
+        ".C": "cpp",
+        ".H": "cpp"
+      }
+    },
+    "csharp-ls": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/proxy.mjs",
+        "csharp-ls"
+      ],
+      "extensionToLanguage": {
+        ".cs": "csharp"
+      }
+    },
+    "gopls": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/proxy.mjs",
+        "gopls"
+      ],
+      "extensionToLanguage": {
+        ".go": "go"
+      }
+    },
+    "jdtls": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/proxy.mjs",
+        "jdtls"
+      ],
+      "extensionToLanguage": {
+        ".java": "java"
+      },
+      "startupTimeout": 120000
+    },
+    "kotlin-lsp": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/proxy.mjs",
+        "kotlin-lsp",
+        "--stdio"
+      ],
+      "extensionToLanguage": {
+        ".kt": "kotlin",
+        ".kts": "kotlin"
+      },
+      "startupTimeout": 120000
+    },
+    "lua": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/proxy.mjs",
+        "lua-language-server"
+      ],
+      "extensionToLanguage": {
+        ".lua": "lua"
+      }
+    },
+    "intelephense": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/proxy.mjs",
+        "intelephense",
+        "--stdio"
+      ],
+      "extensionToLanguage": {
+        ".php": "php"
+      }
+    },
+    "ruby-lsp": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/proxy.mjs",
+        "ruby-lsp"
+      ],
+      "extensionToLanguage": {
+        ".rb": "ruby",
+        ".rake": "ruby",
+        ".gemspec": "ruby",
+        ".ru": "ruby",
+        ".erb": "erb"
+      }
+    },
+    "rust-analyzer": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/proxy.mjs",
+        "rust-analyzer"
+      ],
+      "extensionToLanguage": {
+        ".rs": "rust"
+      }
+    },
+    "sourcekit-lsp": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/proxy.mjs",
+        "sourcekit-lsp"
+      ],
+      "extensionToLanguage": {
+        ".swift": "swift"
       }
     }
   }

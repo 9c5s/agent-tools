@@ -29,28 +29,30 @@ Claude Code --spawn--> node proxy.mjs <実体コマンド> [引数...]
 
 ## 対応言語
 
-| 言語 | 言語サーバー | 対象拡張子 |
+[公式マーケットプレイス](https://github.com/anthropics/claude-plugins-official) の全 LSP プラグインと同じ 12 言語に対応する。対象拡張子は公式定義と同一 (`.claude-plugin/plugin.json` を参照)。
+
+| 言語 | 言語サーバー | 導入例 |
 |---|---|---|
-| TypeScript / JavaScript | typescript-language-server | `.ts` `.tsx` `.js` `.jsx` `.mts` `.cts` `.mjs` `.cjs` |
-| Python | pyright | `.py` `.pyi` |
+| TypeScript / JavaScript | typescript-language-server | `npm install -g typescript-language-server typescript` |
+| Python | pyright | `npm install -g pyright` |
+| C / C++ | clangd | LLVM 同梱 / GitHub リリース |
+| C# | csharp-ls | `dotnet tool install -g csharp-ls` |
+| Go | gopls | `go install golang.org/x/tools/gopls@latest` |
+| Java | jdtls | Eclipse JDT Language Server 配布物 (JDK 17 以上) |
+| Kotlin | kotlin-lsp | JetBrains の kotlin-lsp 配布物 |
+| Lua | lua-language-server | GitHub リリース |
+| PHP | intelephense | `npm install -g intelephense` |
+| Ruby | ruby-lsp | `gem install ruby-lsp` |
+| Rust | rust-analyzer | `rustup component add rust-analyzer` |
+| Swift | sourcekit-lsp | Swift toolchain 同梱 |
+
+プロキシ経由での動作を実機検証済みなのは TypeScript / JavaScript、Python、Go、Rust。他の言語は公式定義の `command` / `args` をプロキシ経由に書き換えたのみだが、プロキシは実体コマンドに依存しないため同様に動作する。
 
 ## インストール
 
-言語サーバー本体は公式プラグインと同様に別途導入しておく。利用する言語のものだけでよい。
+言語サーバー本体は公式プラグインと同様に別途導入しておく。利用する言語のものだけでよい (上表の導入例を参照)。
 
-**TypeScript / JavaScript**
-
-```
-npm install -g typescript-language-server typescript
-```
-
-対象ワークスペースには tsserver.js を同梱する TypeScript 5 系を導入する (`npm install -D typescript@5`)。TypeScript 7 系はネイティブ実装で tsserver.js を同梱しないため、typescript-language-server の初期化が失敗する。
-
-**Python**
-
-```
-npm install -g pyright
-```
+TypeScript / JavaScript では、対象ワークスペースに tsserver.js を同梱する TypeScript 5 系を導入する (`npm install -D typescript@5`)。TypeScript 7 系はネイティブ実装で tsserver.js を同梱しないため、typescript-language-server の初期化が失敗する。
 
 Claude Code の TUI 上で以下を実行:
 
@@ -61,13 +63,13 @@ Claude Code の TUI 上で以下を実行:
 
 ## 対応言語の追加
 
-`.claude-plugin/plugin.json` の `lspServers` に、[公式マーケットプレイス](https://github.com/anthropics/claude-plugins-official) の該当言語の定義を写し、`command` / `args` をプロキシ経由に書き換えて追記する。
+公式マーケットプレイスにない言語サーバーも、`.claude-plugin/plugin.json` の `lspServers` に同じ形式で追記すれば利用できる。起動コマンドの先頭にプロキシを挟むだけでよい。
 
 ```jsonc
-"gopls": {
+"zls": {
   "command": "node",
-  "args": ["${CLAUDE_PLUGIN_ROOT}/proxy.mjs", "gopls"],
-  "extensionToLanguage": { ".go": "go" }
+  "args": ["${CLAUDE_PLUGIN_ROOT}/proxy.mjs", "zls"],
+  "extensionToLanguage": { ".zig": "zig" }
 }
 ```
 
