@@ -15,6 +15,12 @@ Claude Code の TUI 上で以下を実行:
 
 インストール後、収録スキルは `9c5s:<スキル名>` の名前空間で自動的にトリガー可能になる。
 
+LSP 統合を利用する場合は追加で以下を実行:
+
+```
+/plugin install lsp@agent-tools
+```
+
 ## 収録スキル
 
 | 名前 | 用途 |
@@ -27,6 +33,14 @@ Claude Code の TUI 上で以下を実行:
 
 各スキルの詳細は `.agents/skills/<name>/SKILL.md` を参照。
 
+## 収録プラグイン
+
+| 名前 | 用途 |
+|---|---|
+| `lsp` | Windows 上の Claude Code で LSP サーバーとの通信を修復する、透過プロキシ経由の LSP 統合 |
+
+詳細は [`lsp/README.md`](./lsp/README.md) を参照。
+
 ## リポジトリ構成
 
 ```
@@ -35,6 +49,10 @@ agent-tools/
 ├── .agents/                          # プラグインルート (install 対象)
 │   ├── .claude-plugin/plugin.json    # プラグイン定義
 │   └── skills/                       # 5スキル
+├── lsp/                              # LSP 統合プラグイン (install 対象)
+│   ├── .claude-plugin/plugin.json    # プラグイン定義
+│   ├── proxy.mjs                     # エージェント非依存の LSP stdio プロキシ
+│   └── test/                         # プロキシの自動テスト
 ├── .claude/                          # 個人設定 (install 対象外、公開のみ)
 │   ├── CLAUDE.md
 │   ├── commands/

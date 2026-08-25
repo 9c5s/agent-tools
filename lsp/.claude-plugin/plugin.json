@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "lsp",
+  "version": "0.1.0",
+  "author": { "name": "9c5s" },
+  "description": "Windows 上の Claude Code で LSP サーバーとの通信を修復する透過プロキシ経由の LSP 統合",
+  "lspServers": {
+    "typescript": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/proxy.mjs",
+        "typescript-language-server",
+        "--stdio"
+      ],
+      "extensionToLanguage": {
+        ".ts": "typescript",
+        ".tsx": "typescriptreact",
+        ".js": "javascript",
+        ".jsx": "javascriptreact",
+        ".mts": "typescript",
+        ".cts": "typescript",
+        ".mjs": "javascript",
+        ".cjs": "javascript"
+      }
+    }
+  }
+}
