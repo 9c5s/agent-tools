@@ -1,7 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "lsp",
-  "version": "0.3.0",
   "author": { "name": "9c5s" },
   "description": "Windows 上の Claude Code で LSP サーバーとの通信を修復する透過プロキシ経由の LSP 統合",
   "lspServers": {
