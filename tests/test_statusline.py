@@ -4,6 +4,7 @@
 # pyright: reportPrivateUsage=false
 
 import json
+import subprocess
 import sys
 import tempfile
 import time
@@ -20,6 +21,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / ".claude" / "scripts"))
 import statusline
+
+# autouse fixture が _spawn_usage_refresh を差し替えるため、実体の検証用に import 時点の関数を保持する
+_SPAWN_USAGE_REFRESH = statusline._spawn_usage_refresh
 
 
 def _mock_http_response(body: bytes) -> MagicMock:
@@ -2244,6 +2248,22 @@ class TestFetchModelUsage:
             assert statusline._fetch_usage_snapshot() is None
 
 
+class TestSpawnUsageRefresh:
+    """_spawn_usage_refresh のテスト"""
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows 固有の起動フラグ")
+    def test_hides_console_window_without_detaching_on_windows(self) -> None:
+        """Windows では CREATE_NO_WINDOW だけを指定し DETACHED_PROCESS を併用しない
+
+        DETACHED_PROCESS と併用すると CREATE_NO_WINDOW は無視される(Windows の仕様)
+        uv の仮想環境では sys.executable がランチャーで実体の python.exe を
+        起動し直すため、デタッチすると孫プロセスが可視のコンソール窓を割り当てる
+        """
+        with patch("statusline.subprocess.Popen") as popen:
+            _SPAWN_USAGE_REFRESH()
+        assert popen.call_args.kwargs["creationflags"] == subprocess.CREATE_NO_WINDOW
+
+
 class TestGetModelUsage:
     """_get_model_usage のテスト"""
 
@@ -2280,9 +2300,12 @@ class TestGetModelUsage:
         spawn.assert_not_called()
 
     def test_returns_expired_data_and_spawns(self, tmp_path: Path) -> None:
-        """TTL切れでは期限切れデータを返しつつ更新を起動する"""
+        """TTL切れでは期限切れデータを返しつつ更新を起動する
+
+        経過時間は TTL 超過かつ STALE 以内とし、足切りとは独立に検証する
+        """
         cache = tmp_path / "usage.json"
-        old = time.time() - 10_000
+        old = time.time() - 600
         self._write_cache(cache, cached_at=old, attempted_at=old)
         with (
             patch.object(statusline, "_MODEL_USAGE_CACHE_PATH", cache),
@@ -2290,6 +2313,40 @@ class TestGetModelUsage:
         ):
             result = statusline._get_model_usage()
         assert result == [self._ENTRY]
+        spawn.assert_called_once()
+
+    def test_drops_entries_not_refreshed_within_stale_limit(
+        self, tmp_path: Path
+    ) -> None:
+        """STALE を超えて更新できていないキャッシュの値は表示に使わない
+
+        認証切れなどで更新が止まった際に古い値を出し続けないための足切りである
+        """
+        cache = tmp_path / "usage.json"
+        now = time.time()
+        self._write_cache(cache, cached_at=now - 10_000, attempted_at=now)
+        with (
+            patch.object(statusline, "_MODEL_USAGE_CACHE_PATH", cache),
+            patch.object(statusline, "_spawn_usage_refresh"),
+        ):
+            assert statusline._get_model_usage() is None
+
+    def test_records_attempt_before_spawn_so_next_render_skips(
+        self, tmp_path: Path
+    ) -> None:
+        """更新の起動前に試行時刻を記録し、直後の描画では重複起動しない
+
+        子プロセスが取得を終える前に描画が繰り返されても更新は 1 回だけ起動する
+        """
+        cache = tmp_path / "usage.json"
+        old = time.time() - 600
+        self._write_cache(cache, cached_at=old, attempted_at=old)
+        with (
+            patch.object(statusline, "_MODEL_USAGE_CACHE_PATH", cache),
+            patch.object(statusline, "_spawn_usage_refresh") as spawn,
+        ):
+            statusline._get_model_usage()
+            statusline._get_model_usage()
         spawn.assert_called_once()
 
     def test_does_not_spawn_within_retry_interval(self, tmp_path: Path) -> None:
@@ -2403,14 +2460,18 @@ class TestWithCachedWeekly:
         with patch.object(statusline, "_MODEL_USAGE_CACHE_PATH", cache):
             return statusline._with_cached_weekly(self._DATA)
 
+    def _fresh_cache(self, weekly: dict[str, Any], age: float = 0.0) -> dict[str, Any]:
+        """指定の週次値を age 秒前に取得したキャッシュ内容を生成する"""
+        return {"weekly": weekly, "_cached_at": time.time() - age}
+
     def test_replaces_seven_day_with_cached_value(self, tmp_path: Path) -> None:
         """キャッシュの週次値で seven_day を差し替える"""
-        got = self._apply({"weekly": self._WEEKLY}, tmp_path)
+        got = self._apply(self._fresh_cache(self._WEEKLY), tmp_path)
         assert got["rate_limits"]["seven_day"] == self._WEEKLY
 
     def test_keeps_five_hour_untouched(self, tmp_path: Path) -> None:
         """5h は差し替えない"""
-        got = self._apply({"weekly": self._WEEKLY}, tmp_path)
+        got = self._apply(self._fresh_cache(self._WEEKLY), tmp_path)
         assert got["rate_limits"]["five_hour"] == self._DATA["rate_limits"]["five_hour"]
 
     def test_returns_original_without_cache(self, tmp_path: Path) -> None:
@@ -2419,12 +2480,20 @@ class TestWithCachedWeekly:
 
     def test_returns_original_when_weekly_invalid(self, tmp_path: Path) -> None:
         """週次値が不正なら元の data を返す"""
-        got = self._apply({"weekly": {"used_percentage": None}}, tmp_path)
+        got = self._apply(self._fresh_cache({"used_percentage": None}), tmp_path)
+        assert got == self._DATA
+
+    def test_returns_original_when_cache_is_stale(self, tmp_path: Path) -> None:
+        """STALE を超えて更新できていないキャッシュの週次値は使わない
+
+        モデル別枠と同じ足切りを適用し、片方だけ古い値が混ざらないようにする
+        """
+        got = self._apply(self._fresh_cache(self._WEEKLY, age=10_000), tmp_path)
         assert got == self._DATA
 
     def test_does_not_mutate_input(self, tmp_path: Path) -> None:
         """元の data を書き換えない"""
-        self._apply({"weekly": self._WEEKLY}, tmp_path)
+        self._apply(self._fresh_cache(self._WEEKLY), tmp_path)
         assert self._DATA["rate_limits"]["seven_day"]["used_percentage"] == 99
 
 
@@ -2488,7 +2557,10 @@ class TestSegRate7dModelUsage:
         """通常値もキャッシュの週次値を使う(内訳と表示時点を揃えるため)"""
         cache = tmp_path / "usage.json"
         cache.write_text(
-            json.dumps({"weekly": {"used_percentage": 60, "resets_at": 1787454000}}),
+            json.dumps({
+                "weekly": {"used_percentage": 60, "resets_at": 1787454000},
+                "_cached_at": time.time(),
+            }),
             encoding="utf-8",
         )
         with (

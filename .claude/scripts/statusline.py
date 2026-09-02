@@ -242,6 +242,7 @@ _CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 _MODEL_USAGE_CACHE_PATH = Path(tempfile.gettempdir()) / "claude-model-usage.json"
 _MODEL_USAGE_TTL = 300  # 秒。Claude Code 本体のキャッシュ TTL と揃える
 _MODEL_USAGE_RETRY_INTERVAL = 60  # 秒。取得失敗時の再試行を抑制する間隔
+_MODEL_USAGE_STALE = 900  # 秒。これを超えて更新が止まったキャッシュは表示に使わない
 
 _CURRENCIES: dict[str, _CurrencyInfo] = {
     "USD": _CurrencyInfo(symbol="$", decimals=2),
@@ -941,9 +942,11 @@ def _spawn_usage_refresh() -> None:
     """
     kwargs: dict[str, Any] = {}
     if sys.platform == "win32":
-        kwargs["creationflags"] = (
-            subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
-        )
+        # DETACHED_PROCESS を併用すると CREATE_NO_WINDOW は無視される(Windows の仕様)
+        # uv の仮想環境では sys.executable がランチャーで実体の python.exe を起動し直すため
+        # デタッチすると孫プロセスが可視のコンソール窓を割り当ててしまう
+        # CREATE_NO_WINDOW 単独なら非表示のコンソールを孫まで引き継ぎ、親の終了にも影響されない
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     else:
         kwargs["start_new_session"] = True
 
@@ -957,31 +960,62 @@ def _spawn_usage_refresh() -> None:
         )
 
 
+def _is_usage_cache_usable(cache: dict[str, Any], now: float) -> bool:
+    """最後に取得できてから _MODEL_USAGE_STALE 以内のキャッシュか判定する
+
+    認証切れなどで更新が止まった際に古い値を出し続けないための足切りである
+    """
+    cached_at = _safe_float(cache.get("_cached_at"))
+    return cached_at is not None and now - cached_at < _MODEL_USAGE_STALE
+
+
+def _mark_usage_attempt(now: float) -> None:
+    """更新の試行時刻をキャッシュへ記録する
+
+    子プロセスの起動前に記録し、取得が終わるまでの描画で更新を重複起動させない
+    """
+    with _file_lock(_MODEL_USAGE_CACHE_PATH):
+        cache = _read_cache_obj(_MODEL_USAGE_CACHE_PATH)
+        cache["_attempted_at"] = now
+        _write_cache(_MODEL_USAGE_CACHE_PATH, cache)
+
+
 def _get_model_usage() -> list[_ModelUsageEntry] | None:
     """モデル別の週次枠をキャッシュから取得する
 
     この経路では HTTP を発行しない
     期限切れの場合は古い値を返しつつ、更新プロセスを別途起動する
     取得に失敗し続けても再試行が過剰にならないよう試行時刻で間隔を空ける
+    試行時刻は起動前に記録し、取得中の描画が更新を重複起動しないようにする
+    STALE を超えて更新できていない値は返さない(古い値を出し続けないための足切り)
     """
     cache = _read_cache_obj(_MODEL_USAGE_CACHE_PATH)
-    data = cache.get("data")
-    entries = data if isinstance(data, list) else None
-
     now = datetime.now(UTC).timestamp()
+    data = cache.get("data")
+    entries = (
+        data if isinstance(data, list) and _is_usage_cache_usable(cache, now) else None
+    )
+
     cached_at = _safe_float(cache.get("_cached_at")) or 0.0
     attempted_at = _safe_float(cache.get("_attempted_at")) or 0.0
 
     is_fresh = entries is not None and now - cached_at < _MODEL_USAGE_TTL
     if not is_fresh and now - attempted_at >= _MODEL_USAGE_RETRY_INTERVAL:
+        _mark_usage_attempt(now)
         _spawn_usage_refresh()
 
     return entries
 
 
 def _cached_weekly_bucket() -> dict[str, Any] | None:
-    """使用量キャッシュの週次バケットを返す(無ければ None)"""
-    weekly = _read_cache_obj(_MODEL_USAGE_CACHE_PATH).get("weekly")
+    """使用量キャッシュの週次バケットを返す(無い、または STALE 超過なら None)
+
+    モデル別枠と同じ足切りを適用し、片方だけ古い値が混ざらないようにする
+    """
+    cache = _read_cache_obj(_MODEL_USAGE_CACHE_PATH)
+    if not _is_usage_cache_usable(cache, datetime.now(UTC).timestamp()):
+        return None
+    weekly = cache.get("weekly")
     if not isinstance(weekly, dict):
         return None
     if _safe_float(weekly.get("used_percentage")) is None:
