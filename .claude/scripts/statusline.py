@@ -1123,9 +1123,10 @@ def _seg_model(data: dict[str, Any]) -> Segment | None:
     """モデル名セグメントを生成する
 
     display_nameを base_name と括弧部分に分離し、
-    "base_name version (context) effort" の順で組み立てる
+    "base_name version (paren) effort" の順で組み立てる
+    コンテキスト長の括弧は表示しない(1M 以外を明示して使うことはまず無く情報量が無い)
     例: display_name="Opus (1M context)", id="claude-opus-4-7", effort="high"
-    -> "Opus 4.7 (1M) high"
+    -> "Opus 4.7 high"
     """
     model = data.get("model")
     if not isinstance(model, dict):
@@ -1138,18 +1139,16 @@ def _seg_model(data: dict[str, Any]) -> Segment | None:
         return None
 
     # display_name から括弧部分を分離する
-    # 例: "Opus (1M context)" -> base="Opus", paren="(1M)"
+    # 例: "Opus (1M context)" -> base="Opus", paren="(1M context)"
+    # " context)" で終わる括弧はコンテキスト長の表記なので落とし、それ以外の括弧は保持する
     base_name = display_name
     paren_text = ""
     paren_idx = display_name.find("(")
     if paren_idx >= 0:
         base_name = display_name[:paren_idx].rstrip()
         paren_text = display_name[paren_idx:]
-        # 末尾の " context)" のみを ")" に短縮する
-        # (内部に出現する "context" の文字列を意図せず置換しないため)
-        context_suffix = " context)"
-        if paren_text.endswith(context_suffix):
-            paren_text = paren_text[: -len(context_suffix)] + ")"
+        if paren_text.endswith(" context)"):
+            paren_text = ""
 
     # model_idからバージョン番号を抽出する
     # 例: "claude-opus-4-6" -> "4.6"

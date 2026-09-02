@@ -1085,18 +1085,22 @@ class TestSegModel:
         assert "4.6 4.6" not in seg.text
         assert "Opus 4.6" in seg.text
 
-    def test_shortens_context_suffix_in_display_name(self) -> None:
-        """display_nameの"(1M context)"を"(1M)"に短縮する"""
+    def test_drops_context_paren_in_display_name(self) -> None:
+        """display_nameの"(1M context)"は表示しない
+
+        1M 以外のコンテキスト長を明示して使うことはまず無く、情報量が無いためである
+        """
         data = {
             "model": {"display_name": "Opus 4.6 (1M context)", "id": "claude-opus-4-6"}
         }
         seg = statusline._seg_model(data)
         assert seg is not None
-        assert "(1M)" in seg.text
-        assert "context" not in seg.text
+        assert "Opus 4.6" in seg.text
+        assert "1M" not in seg.text
+        assert "(" not in seg.text
 
-    def test_shortens_200k_context_suffix(self) -> None:
-        """display_nameの"(200K context)"も短縮する"""
+    def test_drops_200k_context_paren(self) -> None:
+        """display_nameの"(200K context)"も表示しない"""
         data = {
             "model": {
                 "display_name": "Sonnet 4.5 (200K context)",
@@ -1105,8 +1109,9 @@ class TestSegModel:
         }
         seg = statusline._seg_model(data)
         assert seg is not None
-        assert "(200K)" in seg.text
-        assert "context" not in seg.text
+        assert "Sonnet 4.5" in seg.text
+        assert "200K" not in seg.text
+        assert "(" not in seg.text
 
     def test_no_context_suffix_unchanged(self) -> None:
         """コンテキスト情報がないdisplay_nameはそのまま"""
@@ -1123,15 +1128,15 @@ class TestSegModel:
         assert "CustomModel" in seg.text
 
     def test_effort_level_appended_at_end(self) -> None:
-        """effort.level は base+version+(context) の末尾に併記される"""
+        """effort.level は base+version の末尾に併記される"""
         data = {
             "model": {"display_name": "Opus (1M context)", "id": "claude-opus-4-7"},
             "effort": {"level": "high"},
         }
         seg = statusline._seg_model(data)
         assert seg is not None
-        # 語順: base version (context) effort
-        assert "Opus 4.7 (1M) high" in seg.text
+        # 語順: base version effort (コンテキスト長の括弧は表示しない)
+        assert "Opus 4.7 high" in seg.text
 
     def test_no_effort_no_level_text(self) -> None:
         """Effort キーがない場合は effort 表記が付かない"""
@@ -1154,8 +1159,8 @@ class TestSegModel:
         assert "Opus 4.7" in seg.text
         assert "high" not in seg.text
 
-    def test_paren_context_replaced_only_at_end(self) -> None:
-        """括弧内に複数の'context'が出現しても末尾の' context)'のみ短縮する"""
+    def test_paren_ending_with_context_dropped_entirely(self) -> None:
+        """' context)'で終わる括弧は内容によらず丸ごと表示しない"""
         data = {
             "model": {
                 "display_name": "Opus (1M context context)",
@@ -1164,8 +1169,8 @@ class TestSegModel:
         }
         seg = statusline._seg_model(data)
         assert seg is not None
-        # 末尾のみ短縮されるため、内部の "context" は残る
-        assert "Opus 4.7 (1M context)" in seg.text
+        assert "Opus 4.7" in seg.text
+        assert "(" not in seg.text
 
     def test_paren_without_context_unchanged(self) -> None:
         """括弧内に' context)'がない場合は括弧をそのまま保持する"""
