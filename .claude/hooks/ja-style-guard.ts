@@ -67,9 +67,14 @@ function stripListLabelDash(text: string): string {
     .join('\n')
 }
 
+// インラインコードを取り除く (識別子や書式例を地の文として検査しないため)
+function stripInlineCode(text: string): string {
+  return text.replace(/`[^`\n]*`/g, '')
+}
+
 // 日本語を含む行だけを検査の対象にする (コードや英文の行で誤検知しないため)
 function japaneseLines(text: string): string[] {
-  return stripCodeBlocks(text)
+  return stripInlineCode(stripCodeBlocks(text))
     .split('\n')
     .filter((line) => JA_RE.test(line))
 }
