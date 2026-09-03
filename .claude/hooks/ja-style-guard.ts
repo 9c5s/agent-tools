@@ -1,3 +1,4 @@
+// ja-style-guard: off (検査する語を定義上列挙するため自身は検査しない)
 import { readFileSync } from 'node:fs'
 
 // PreToolUse hook. ツールに渡す日本語の文体と表記を検査する
@@ -76,8 +77,9 @@ export function checkNotation(text: string): string[] {
   if (dash) {
     found.push('ダッシュ (— ―) を日本語の地の文で使わない (括弧か句点で書き分ける)')
   }
-  // 中黒が 2 つ以上ある行だけを並列とみなす (固有名詞の内部は 1 つで足りる)
-  if (lines.some((line) => (line.match(/・/g) ?? []).length >= 2)) {
+  // 中黒が近い間隔で 2 つ以上並ぶ行だけを並列とみなす
+  // 固有名詞の内部は 1 つで足り 別々の複合語にある中黒は間隔が開く
+  if (lines.some((line) => /・[^・\s]{1,12}・/u.test(line))) {
     found.push('中黒 (・) を日本語の並列で使わない (読点か「と」に直す)')
   }
   return found
@@ -88,13 +90,17 @@ export function checkNotation(text: string): string[] {
 const VOCABULARY_RULES: { pattern: RegExp; hint: string }[] = [
   {
     pattern:
-      /落ち(る|た|て|ます)|(?<!見)落と(す|し|そう)|倒(す|れる|し)|潰(す|れる|し)|コケ(る|た)|クラッシュ|殺(す|し)|死ぬ|弾(く|か|い)|叩(く|い)|回(す|して|した)|素通し|張り付/gu,
+      /落ち(る|た|て|ます)|(?<!見)落と(す|し|そう)|倒(す|れる|し)|潰(す|れる|し)|コケ(る|た)|クラッシュ|殺(す|し)|死ぬ|飛(ぶ|んで)|吹っ飛|弾(く|か|い)|叩(く|い)|回(す|して|した)|撃(つ|って)|流(す|して|れる)|詰まる|素通し|張り付|(?<![破崩損])壊(す|れる|れた)|崩(れる|れた)|効く|載(る|って)|食い違/gu,
     hint: '擬人化と口語の動詞を使わない (除外される 異常終了する 無効化する のような正式な表現に直す)',
   },
   {
     pattern:
-      /重要なのは|正面から|深掘り|掘り下げ|言語化|多角的|包括的|総合的|不可欠|核心的|鍵となる|根本的|の観点から|という側面から|に他ならない|非常に|(?<!見)極めて|大いに/gu,
+      /重要なのは|正面から|深掘り|掘り下げ|言語化|多角的|包括的|総合的|不可欠|核心的|鍵となる|根本的|の観点から|という側面から|に他ならない|非常に|(?<!見)極めて|大いに|本章では|見ていく|まとめると|要するに|言えるだろう/gu,
     hint: 'LLM っぽい空虚な言い回しを使わない (主張をそのまま書く)',
+  },
+  {
+    pattern: /[→⇒]|＝/gu,
+    hint: '矢印と ＝ で因果や手順を省略しない (読点 「の順」 番号付きリストに開く。コードの遷移列はコードブロックに入れる)',
   },
   {
     pattern: /いたします|させていただ|でございます|お詫び申し上げ/gu,
@@ -127,13 +133,18 @@ const OFF_MARKER = 'ja-style-guard: off'
 export type Inspection = { block: string | null; warn: string[] }
 
 // tool_input のうち日本語の文章が入りうる場所を集める
+// written は文書としてそのまま残るテキストで 表記の違反はブロックの対象にする
+// command は heredoc で文書を書く経路である一方 検索パターンやデータも混ざるため警告にとどめる
 // Edit の old_string は既存のテキストなので対象にしない
-function textsToInspect(toolName: unknown, input: Record<string, unknown>): string[] {
-  const texts: string[] = []
-  if (typeof input.description === 'string') texts.push(input.description)
-  if (toolName === 'Write' && typeof input.content === 'string') texts.push(input.content)
-  if (toolName === 'Edit' && typeof input.new_string === 'string') texts.push(input.new_string)
-  return texts
+function textsToInspect(
+  toolName: unknown,
+  input: Record<string, unknown>,
+): { written: string[]; command: string[] } {
+  const written: string[] = []
+  if (typeof input.description === 'string') written.push(input.description)
+  if (toolName === 'Write' && typeof input.content === 'string') written.push(input.content)
+  if (toolName === 'Edit' && typeof input.new_string === 'string') written.push(input.new_string)
+  return { written, command: typeof input.command === 'string' ? [input.command] : [] }
 }
 
 // 検査から外すかを判定する
@@ -153,14 +164,18 @@ function isExempt(filePath: unknown, texts: string[]): boolean {
 export function inspect(toolName: unknown, input: unknown): Inspection {
   const record =
     typeof input === 'object' && input !== null ? (input as Record<string, unknown>) : {}
-  const texts = textsToInspect(toolName, record)
+  const { written, command } = textsToInspect(toolName, record)
+  const texts = [...written, ...command]
   if (isExempt(record.file_path, texts)) return { block: null, warn: [] }
 
   const reason = checkDescription(toolName, input)
-  const notation = texts.flatMap((text) => checkNotation(text))
+  const notation = written.flatMap((text) => checkNotation(text))
   return {
     block: reason ?? (notation.length > 0 ? notation.join('\n') : null),
-    warn: texts.flatMap((text) => checkVocabulary(text)),
+    warn: [
+      ...texts.flatMap((text) => checkVocabulary(text)),
+      ...command.flatMap((text) => checkNotation(text)),
+    ],
   }
 }
 
