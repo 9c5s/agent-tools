@@ -1,4 +1,4 @@
-<!-- ja-style-guard: off (使用を避ける語を例示するため) -->
+<!-- ja-style-guard: off -->
 
 # 原則
 

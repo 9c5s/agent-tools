@@ -1,4 +1,4 @@
-// ja-style-guard: off (検査対象の語を列挙するため自身は検査しない)
+// ja-style-guard: off
 import { rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
