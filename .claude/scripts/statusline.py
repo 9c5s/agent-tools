@@ -1219,7 +1219,6 @@ def _seg_lines(data: dict[str, Any]) -> Segment | None:
 def _seg_rate_common(
     data: dict[str, Any],
     usage_key: str,
-    period_label: str,
     icon: str,
     fmt_reset: Callable[[int | float], str],
 ) -> Segment | None:
@@ -1255,17 +1254,13 @@ def _seg_rate_common(
     colored_pct = _colorize(pct_str, color)
     # モデル別の枠は週次にのみ存在するため 7d だけ内訳を併記する
     pct_suffix = _model_usage_suffix() if usage_key == "seven_day" else ""
-    label = (
-        f"{icon} {period_label} {colored_pct}{pct_suffix} {_icons.RESET} {reset_str}"
-    )
+    label = f"{icon} {colored_pct}{pct_suffix} {_icons.RESET} {reset_str}"
     return Segment(text=label)
 
 
 def _seg_rate_5h(data: dict[str, Any]) -> Segment | None:
     """5時間レートリミットセグメントを生成する"""
-    return _seg_rate_common(
-        data, "five_hour", "5h", _icons.CLOCK, _format_reset_time_short
-    )
+    return _seg_rate_common(data, "five_hour", _icons.CLOCK, _format_reset_time_short)
 
 
 def _seg_rate_7d(data: dict[str, Any]) -> Segment | None:
@@ -1277,7 +1272,6 @@ def _seg_rate_7d(data: dict[str, Any]) -> Segment | None:
     return _seg_rate_common(
         _with_cached_weekly(data),
         "seven_day",
-        "7d",
         _icons.CALENDAR,
         _format_reset_date,
     )
