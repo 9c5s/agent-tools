@@ -1,3 +1,4 @@
+// ja-style-guard: off (検査対象の語を列挙するため自身は検査しない)
 import { rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -98,6 +99,12 @@ test('checkNotation は複数の中黒による並列を検知する', () => {
 
 test('checkNotation は中黒が 1 つだけの行を検知しない', () => {
   expect(checkNotation('アイドルマスター・シンデレラガールズを起動する')).toEqual([])
+})
+
+test('checkNotation は離れた位置にある別語の中黒を並列として検知しない', () => {
+  expect(
+    checkNotation('応答は敬体（です・ます調）を基本とし、コメントは「だ・である調」で書く'),
+  ).toEqual([])
 })
 
 test('checkVocabulary は擬人化した動詞を検知する', () => {
@@ -215,4 +222,77 @@ test('warningPayload は additionalContext を持つ PreToolUse の JSON を返�
 test('warningPayload は permissionDecision を含めない', () => {
   const payload = JSON.parse(warningPayload(['指摘 A']))
   expect(payload.hookSpecificOutput.permissionDecision).toBeUndefined()
+})
+
+test('inspect は Bash の command を検査する', () => {
+  const result = inspect('Bash', {
+    command: 'echo "接続が落ちる" >> memo.md',
+    description: 'メモに追記する',
+  })
+  expect(result.warn.join('')).toContain('落ちる')
+})
+
+test('inspect は PowerShell の command を検査する', () => {
+  const result = inspect('PowerShell', {
+    command: 'Set-Content memo.md "接続が落ちる"',
+    description: 'メモを書き出す',
+  })
+  expect(result.warn.join('')).toContain('落ちる')
+})
+
+test('inspect は command の表記違反を警告にとどめる', () => {
+  const result = inspect('Bash', {
+    command: 'echo "実行の結果を記録する." >> memo.md',
+    description: 'メモに追記する',
+  })
+  expect(result.block).toBeNull()
+  expect(result.warn.join('')).toContain('句読点')
+})
+
+test('inspect は command の検索パターンでブロックしない', () => {
+  const result = inspect('Bash', {
+    command: 'grep "太字・矢印・中黒" doc.md',
+    description: '表記を検索する',
+  })
+  expect(result.block).toBeNull()
+})
+
+test('checkVocabulary は設計文書で置換された口語動詞を検知する', () => {
+  expect(checkVocabulary('設定が効く場合がある').join('')).toContain('効く')
+  expect(checkVocabulary('順序が食い違う').join('')).toContain('食い違')
+  expect(checkVocabulary('画面に載る値を確かめる').join('')).toContain('載る')
+  expect(checkVocabulary('索引が壊れる').join('')).toContain('壊れる')
+})
+
+test('checkVocabulary は文書から除かれた口語動詞を検知する', () => {
+  expect(checkVocabulary('リクエストを撃つ').join('')).toContain('撃つ')
+  expect(checkVocabulary('ログを流す').join('')).toContain('流す')
+  expect(checkVocabulary('処理が詰まる').join('')).toContain('詰まる')
+  expect(checkVocabulary('設定が飛ぶ').join('')).toContain('飛ぶ')
+})
+
+test('checkVocabulary は LLM っぽい予告と総括を検知する', () => {
+  expect(checkVocabulary('本章では設計を扱う').join('')).toContain('本章では')
+  expect(checkVocabulary('まとめると次のとおりである').join('')).toContain('まとめると')
+  expect(checkVocabulary('有効だと言えるだろう').join('')).toContain('言えるだろう')
+})
+
+test('checkVocabulary は地の文の矢印と等号を検知する', () => {
+  expect(checkVocabulary('退避 → 削除 → 再導入の順に進める').join('')).toContain('矢印')
+  expect(checkVocabulary('速度＝距離を時間で割った値である').join('')).toContain('＝')
+})
+
+test('checkVocabulary はコードブロックの矢印を検知しない', () => {
+  const text = ['状態の遷移を書く', '```', 'idle → running → done', '```'].join('\n')
+  expect(checkVocabulary(text)).toEqual([])
+})
+
+test('checkVocabulary は破壊と崩壊を口語動詞として検知しない', () => {
+  expect(checkVocabulary('データを破壊する')).toEqual([])
+  expect(checkVocabulary('構造が崩壊する')).toEqual([])
+})
+
+test('checkVocabulary は記載と流用を口語動詞として検知しない', () => {
+  expect(checkVocabulary('経緯を記載する')).toEqual([])
+  expect(checkVocabulary('設定を流用する')).toEqual([])
 })
