@@ -132,6 +132,10 @@ test('checkVocabulary は「見落とし」を擬人化として検知しない'
   expect(checkVocabulary('境界条件の見落としがある')).toEqual([])
 })
 
+test('checkVocabulary は「落とし穴」を擬人化として検知しない', () => {
+  expect(checkVocabulary('運用でよくある落とし穴を挙げる')).toEqual([])
+})
+
 test('checkVocabulary は LLM っぽい前置きを検知する', () => {
   expect(checkVocabulary('重要なのは順序である').join('')).toContain('重要なのは')
 })
