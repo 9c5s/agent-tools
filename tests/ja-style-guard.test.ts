@@ -93,6 +93,19 @@ test('checkNotation は英文だけの行の em ダッシュを検知しない',
   expect(checkNotation('Curry—Howard correspondence')).toEqual([])
 })
 
+test('checkNotation は箇条書きのラベル区切りの em ダッシュを検知しない', () => {
+  expect(checkNotation('- [規約](feedback_style.md) — 文体の規約')).toEqual([])
+  expect(checkNotation('- 「変更内容を簡潔に」 — 冗長な語を刈る')).toEqual([])
+})
+
+test('checkNotation は箇条書きでも 2 倍ダッシュを検知する', () => {
+  expect(checkNotation('- この方式——分割して扱う方法——を採る').join('')).toContain('ダッシュ')
+})
+
+test('checkNotation は箇条書きでない行の em ダッシュを検知する', () => {
+  expect(checkNotation('この方式 — 分割して扱う方法 — を採る').join('')).toContain('ダッシュ')
+})
+
 test('checkNotation は複数の中黒による並列を検知する', () => {
   expect(checkNotation('太字・矢印・中黒を直す').join('')).toContain('中黒')
 })

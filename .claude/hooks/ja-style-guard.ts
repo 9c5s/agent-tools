@@ -57,6 +57,16 @@ function stripCodeBlocks(text: string): string {
     .join('\n')
 }
 
+// 箇条書きのラベルと説明を区切る em ダッシュを取り除く
+// 索引や項目の一覧で広く使われている書式で 地の文のダッシュとは役割が違う
+// 2 倍ダッシュと 箇条書き以外の行のダッシュは残して検知させる
+function stripListLabelDash(text: string): string {
+  return text
+    .split('\n')
+    .map((line) => (/^\s*[-*] /.test(line) ? line.replace(/(?<!—) — (?!—)/gu, ' ') : line))
+    .join('\n')
+}
+
 // 日本語を含む行だけを検査の対象にする (コードや英文の行で誤検知しないため)
 function japaneseLines(text: string): string[] {
   return stripCodeBlocks(text)
@@ -73,7 +83,7 @@ export function checkNotation(text: string): string[] {
   if (halfPunct) {
     found.push(`日本語文の句読点は 、 。 を使う (半角の , . は使わない): ${halfPunct.join(' ')}`)
   }
-  const dash = target.match(DASH_RE)
+  const dash = stripListLabelDash(target).match(DASH_RE)
   if (dash) {
     found.push('ダッシュ (— ―) を日本語の地の文で使わない (括弧か句点で書き分ける)')
   }
