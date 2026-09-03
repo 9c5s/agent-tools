@@ -1,0 +1,196 @@
+import { readFileSync } from 'node:fs'
+
+// PreToolUse hook. ツールに渡す日本語の文体と表記を検査する
+// description の言語と表記の機械的な違反は exit 2 で止め stderr の理由が Claude に返る
+// 語彙と言い回しは文脈で可否が変わるため止めず additionalContext で警告だけを返す
+// 対象は description を持つ全ツールと Write の content Edit の new_string である
+
+// ひらがな カタカナ 漢字のいずれかを含めば日本語とみなす
+// 技術用語やコード識別子だけの英文説明を弾くための最小の判定である
+// 中黒や長音記号は script が Common で文字自体は日本語でないため字種の指定で除外する
+const JA_RE = /[\p{sc=Hiragana}\p{sc=Katakana}\p{sc=Han}]/u
+
+// description を必須とするツール (コマンド通知の説明表示に使うため欠落も拒否する)
+const REQUIRE_DESC = new Set(['Bash', 'PowerShell'])
+
+// 拒否理由を返す (許可なら null)
+// description があれば日本語判定し 無ければ REQUIRE_DESC のツールのみ欠落として拒否する
+export function checkDescription(toolName: unknown, input: unknown): string | null {
+  const desc =
+    typeof input === 'object' && input !== null
+      ? (input as Record<string, unknown>).description
+      : undefined
+  if (typeof desc === 'string' && desc.trim()) {
+    if (JA_RE.test(desc)) return null
+    return `description は日本語で書き直すこと (技術用語とコード識別子は原文のまま可): ${desc}`
+  }
+  if (typeof toolName === 'string' && REQUIRE_DESC.has(toolName)) {
+    return 'description に日本語のコマンド説明を付けること'
+  }
+  return null
+}
+
+// 日本語文の句読点に半角の , . が使われていないかを探す
+// 直後が英数字なら拡張子やバージョン番号とみなして見逃す
+const HALF_PUNCT_RE = /[\p{sc=Hiragana}\p{sc=Katakana}\p{sc=Han}][,.](?![0-9A-Za-z])/gu
+
+// 日本語と英数字が半角スペースなしで隣接している箇所を探す
+const JA_ASCII_RE =
+  /[\p{sc=Hiragana}\p{sc=Katakana}\p{sc=Han}][0-9A-Za-z]|[0-9A-Za-z][\p{sc=Hiragana}\p{sc=Katakana}\p{sc=Han}]/gu
+
+// 日本語の地の文で使わないダッシュ類 (em ダッシュと horizontal bar)
+const DASH_RE = /[—―]/gu
+
+// Markdown のコードブロックを取り除く (サンプルやログの引用を検査しないため)
+function stripCodeBlocks(text: string): string {
+  let inside = false
+  return text
+    .split('\n')
+    .filter((line) => {
+      if (/^\s*```/.test(line)) {
+        inside = !inside
+        return false
+      }
+      return !inside
+    })
+    .join('\n')
+}
+
+// 日本語を含む行だけを検査の対象にする (コードや英文の行で誤検知しないため)
+function japaneseLines(text: string): string[] {
+  return stripCodeBlocks(text)
+    .split('\n')
+    .filter((line) => JA_RE.test(line))
+}
+
+// 表記の機械的な違反を集める (字面だけで判定できるものに限る)
+export function checkNotation(text: string): string[] {
+  const found: string[] = []
+  const lines = japaneseLines(text)
+  const target = lines.join('\n')
+  const halfPunct = target.match(HALF_PUNCT_RE)
+  if (halfPunct) {
+    found.push(`日本語文の句読点は 、 。 を使う (半角の , . は使わない): ${halfPunct.join(' ')}`)
+  }
+  const dash = target.match(DASH_RE)
+  if (dash) {
+    found.push('ダッシュ (— ―) を日本語の地の文で使わない (括弧か句点で書き分ける)')
+  }
+  // 中黒が 2 つ以上ある行だけを並列とみなす (固有名詞の内部は 1 つで足りる)
+  if (lines.some((line) => (line.match(/・/g) ?? []).length >= 2)) {
+    found.push('中黒 (・) を日本語の並列で使わない (読点か「と」に直す)')
+  }
+  return found
+}
+
+// 使用を避ける語彙と言い回し 同じ語でも文脈で可否が変わるため警告にとどめる
+// 除外の先読みは 別語に当たる代表例だけを外す最小限にする
+const VOCABULARY_RULES: { pattern: RegExp; hint: string }[] = [
+  {
+    pattern:
+      /落ち(る|た|て|ます)|(?<!見)落と(す|し|そう)|倒(す|れる|し)|潰(す|れる|し)|コケ(る|た)|クラッシュ|殺(す|し)|死ぬ|弾(く|か|い)|叩(く|い)|回(す|して|した)|素通し|張り付/gu,
+    hint: '擬人化と口語の動詞を使わない (除外される 異常終了する 無効化する のような正式な表現に直す)',
+  },
+  {
+    pattern:
+      /重要なのは|正面から|深掘り|掘り下げ|言語化|多角的|包括的|総合的|不可欠|核心的|鍵となる|根本的|の観点から|という側面から|に他ならない|非常に|(?<!見)極めて|大いに/gu,
+    hint: 'LLM っぽい空虚な言い回しを使わない (主張をそのまま書く)',
+  },
+  {
+    pattern: /いたします|させていただ|でございます|お詫び申し上げ/gu,
+    hint: '過剰な丁寧語を使わない (します です に直す)',
+  },
+  {
+    pattern: JA_ASCII_RE,
+    hint: '日本語と英数字の境界には半角スペースを入れる',
+  },
+]
+
+// 語彙と言い回しの指摘を集める (ブロックはせず警告として返す)
+export function checkVocabulary(text: string): string[] {
+  const target = japaneseLines(text).join('\n')
+  if (!target) return []
+  const found: string[] = []
+  for (const rule of VOCABULARY_RULES) {
+    const matched = target.match(rule.pattern)
+    if (matched) {
+      found.push(`${rule.hint}: ${[...new Set(matched)].join(' ')}`)
+    }
+  }
+  return found
+}
+
+// 検査を止めるマーカー 使用を避ける語彙そのものを列挙する文書で使う
+const OFF_MARKER = 'ja-style-guard: off'
+
+// 検査の結果 block があればツールを止め warn は指摘としてだけ返す
+export type Inspection = { block: string | null; warn: string[] }
+
+// tool_input のうち日本語の文章が入りうる場所を集める
+// Edit の old_string は既存のテキストなので対象にしない
+function textsToInspect(toolName: unknown, input: Record<string, unknown>): string[] {
+  const texts: string[] = []
+  if (typeof input.description === 'string') texts.push(input.description)
+  if (toolName === 'Write' && typeof input.content === 'string') texts.push(input.content)
+  if (toolName === 'Edit' && typeof input.new_string === 'string') texts.push(input.new_string)
+  return texts
+}
+
+// 検査から外すかを判定する
+// 書き込む内容のほか 編集先のファイルの先頭にマーカーがある場合も対象にする
+function isExempt(filePath: unknown, texts: string[]): boolean {
+  if (texts.some((text) => text.includes(OFF_MARKER))) return true
+  if (typeof filePath !== 'string') return false
+  try {
+    return readFileSync(filePath, 'utf8').slice(0, 500).includes(OFF_MARKER)
+  } catch {
+    // 読めないファイルは検査の対象として扱う
+    return false
+  }
+}
+
+// ツール呼び出しを検査して ブロックする理由と警告に分けて返す
+export function inspect(toolName: unknown, input: unknown): Inspection {
+  const record =
+    typeof input === 'object' && input !== null ? (input as Record<string, unknown>) : {}
+  const texts = textsToInspect(toolName, record)
+  if (isExempt(record.file_path, texts)) return { block: null, warn: [] }
+
+  const reason = checkDescription(toolName, input)
+  const notation = texts.flatMap((text) => checkNotation(text))
+  return {
+    block: reason ?? (notation.length > 0 ? notation.join('\n') : null),
+    warn: texts.flatMap((text) => checkVocabulary(text)),
+  }
+}
+
+// 警告を Claude へ届ける JSON を組み立てる
+// permissionDecision は付けず 通常の許可の流れに任せる (止めたい場合は exit 2 を使う)
+export function warningPayload(warn: string[]): string {
+  return JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      additionalContext: ['日本語の表現に指摘がある', ...warn].join('\n'),
+    },
+  })
+}
+
+// 直接実行時は stdin の hook payload を検査する
+// payload が読めない場合は許可する (hook 自体の不具合でツール実行を止めないため)
+if (import.meta.main) {
+  try {
+    const payload = JSON.parse(
+      await new Response(Bun.stdin.stream()).text(),
+    ) as Record<string, unknown>
+    const result = inspect(payload.tool_name, payload.tool_input)
+    if (result.block !== null) {
+      process.stderr.write(result.block)
+      process.exit(2)
+    }
+    if (result.warn.length > 0) {
+      process.stdout.write(warningPayload(result.warn))
+    }
+  } catch {
+    // 解析失敗は許可として扱う
+  }
+}
