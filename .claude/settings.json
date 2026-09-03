@@ -60,7 +60,7 @@
           {
             "type": "command",
             "command": "bun ~/.claude/hooks/ja-style-guard.ts",
-            "timeout": 10
+            "timeout": 1
           }
         ]
       }
