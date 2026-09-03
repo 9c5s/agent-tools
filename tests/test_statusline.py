@@ -1307,19 +1307,18 @@ class TestSegRateCommon:
             seg = statusline._seg_rate_common(
                 data,
                 "five_hour",
-                "5h",
                 "\u23f0",
                 statusline._format_reset_time_short,
             )
         assert seg is not None
-        assert "5h" in seg.text
+        assert "5h" not in seg.text
         assert "45%" in seg.text
         assert "14:30" in seg.text
 
     def test_no_rate_limits_returns_none(self) -> None:
         """rate_limitsがない場合はNone"""
         seg = statusline._seg_rate_common(
-            {}, "five_hour", "5h", "\u23f0", statusline._format_reset_time_short
+            {}, "five_hour", "\u23f0", statusline._format_reset_time_short
         )
         assert seg is None
 
@@ -1327,7 +1326,7 @@ class TestSegRateCommon:
         """指定のバケットがない場合はNone"""
         data: dict[str, Any] = {"rate_limits": {}}
         seg = statusline._seg_rate_common(
-            data, "five_hour", "5h", "\u23f0", statusline._format_reset_time_short
+            data, "five_hour", "\u23f0", statusline._format_reset_time_short
         )
         assert seg is None
 
@@ -1335,7 +1334,7 @@ class TestSegRateCommon:
         """used_percentageがない場合はNone"""
         data = {"rate_limits": {"five_hour": {"resets_at": 1736951400.0}}}
         seg = statusline._seg_rate_common(
-            data, "five_hour", "5h", "\u23f0", statusline._format_reset_time_short
+            data, "five_hour", "\u23f0", statusline._format_reset_time_short
         )
         assert seg is None
 
@@ -1353,7 +1352,6 @@ class TestSegRateCommon:
             seg = statusline._seg_rate_common(
                 data,
                 "five_hour",
-                "5h",
                 "\u23f0",
                 statusline._format_reset_time_short,
             )
@@ -1371,7 +1369,7 @@ class TestSegRateCommon:
             },
         }
         seg = statusline._seg_rate_common(
-            data, "five_hour", "5h", "\u23f0", statusline._format_reset_time_short
+            data, "five_hour", "\u23f0", statusline._format_reset_time_short
         )
         assert seg is None
 
@@ -1379,7 +1377,7 @@ class TestSegRateCommon:
         """resets_atがない場合はNone"""
         data = {"rate_limits": {"five_hour": {"used_percentage": 45.0}}}
         seg = statusline._seg_rate_common(
-            data, "five_hour", "5h", "\u23f0", statusline._format_reset_time_short
+            data, "five_hour", "\u23f0", statusline._format_reset_time_short
         )
         assert seg is None
 
@@ -1397,7 +1395,7 @@ class TestSegRateCommon:
         def failing_fmt(_ts: float) -> str:
             raise OverflowError
 
-        seg = statusline._seg_rate_common(data, "five_hour", "5h", "X", failing_fmt)
+        seg = statusline._seg_rate_common(data, "five_hour", "X", failing_fmt)
         assert seg is None
 
 
@@ -1417,7 +1415,7 @@ class TestSegRate5hAnd7d:
         with patch("statusline._format_reset_time_short", return_value="14:30"):
             seg = statusline._seg_rate_5h(data)
         assert seg is not None
-        assert "5h" in seg.text
+        assert "5h" not in seg.text
         assert "30%" in seg.text
 
     def test_seg_rate_7d_returns_segment(self) -> None:
@@ -1433,7 +1431,7 @@ class TestSegRate5hAnd7d:
         with patch("statusline._format_reset_date", return_value="1/20 0:00"):
             seg = statusline._seg_rate_7d(data)
         assert seg is not None
-        assert "7d" in seg.text
+        assert "7d" not in seg.text
         assert "50%" in seg.text
 
     def test_seg_rate_5h_no_data_returns_none(self) -> None:
