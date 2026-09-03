@@ -194,15 +194,24 @@ export function inspect(toolName: unknown, input: unknown): Inspection {
   }
 }
 
+// 出力の先頭に付ける識別子 あとから transcript を検索して集計できるようにする
+const AUDIT_BLOCK = '[ja-style-guard:block]'
+const AUDIT_WARN = '[ja-style-guard:warn]'
+
 // 警告を Claude へ届ける JSON を組み立てる
 // permissionDecision は付けず 通常の許可の流れに任せる (止めたい場合は exit 2 を使う)
 export function warningPayload(warn: string[]): string {
   return JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
-      additionalContext: ['日本語の表現に指摘がある', ...warn].join('\n'),
+      additionalContext: [`${AUDIT_WARN} 日本語の表現に指摘がある`, ...warn].join('\n'),
     },
   })
+}
+
+// ブロックの理由を stderr へ出す文言を組み立てる
+export function blockMessage(reason: string): string {
+  return `${AUDIT_BLOCK} ${reason}`
 }
 
 // 直接実行時は stdin の hook payload を検査する
@@ -214,7 +223,7 @@ if (import.meta.main) {
     ) as Record<string, unknown>
     const result = inspect(payload.tool_name, payload.tool_input)
     if (result.block !== null) {
-      process.stderr.write(result.block)
+      process.stderr.write(blockMessage(result.block))
       process.exit(2)
     }
     if (result.warn.length > 0) {
