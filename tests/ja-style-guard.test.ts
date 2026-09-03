@@ -3,7 +3,14 @@ import { rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test, expect } from 'bun:test'
-import { checkDescription, checkNotation, checkVocabulary, inspect, warningPayload } from '../.claude/hooks/ja-style-guard'
+import {
+  blockMessage,
+  checkDescription,
+  checkNotation,
+  checkVocabulary,
+  inspect,
+  warningPayload,
+} from '../.claude/hooks/ja-style-guard'
 
 test('checkDescription は日本語の description を許可する', () => {
   expect(checkDescription('Bash', { command: 'ls', description: 'ファイル一覧を表示' })).toBeNull()
@@ -239,6 +246,17 @@ test('warningPayload は additionalContext を持つ PreToolUse の JSON を返�
   expect(payload.hookSpecificOutput.hookEventName).toBe('PreToolUse')
   expect(payload.hookSpecificOutput.additionalContext).toContain('指摘 A')
   expect(payload.hookSpecificOutput.additionalContext).toContain('指摘 B')
+})
+
+test('warningPayload は監査で追えるマーカーを先頭に付ける', () => {
+  const payload = JSON.parse(warningPayload(['指摘 A']))
+  expect(payload.hookSpecificOutput.additionalContext.startsWith('[ja-style-guard:warn]')).toBe(true)
+})
+
+test('blockMessage は監査で追えるマーカーを先頭に付ける', () => {
+  const message = blockMessage('中黒 (・) を日本語の並列で使わない')
+  expect(message.startsWith('[ja-style-guard:block]')).toBe(true)
+  expect(message).toContain('中黒')
 })
 
 test('warningPayload は permissionDecision を含めない', () => {
