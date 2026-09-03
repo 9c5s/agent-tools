@@ -1,4 +1,4 @@
-// ja-style-guard: off (検査する語を定義上列挙するため自身は検査しない)
+// ja-style-guard: off
 import { readFileSync } from 'node:fs'
 
 // PreToolUse hook. ツールに渡す日本語の文体と表記を検査する
