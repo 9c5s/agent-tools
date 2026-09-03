@@ -149,6 +149,11 @@ test('checkNotation は Markdown のコードブロックの中を検査しな�
   expect(checkNotation(text)).toEqual([])
 })
 
+test('checkNotation はインラインコードの中を検査しない', () => {
+  expect(checkNotation('書式は `項目: 値, 値, 値` のように並べる')).toEqual([])
+  expect(checkNotation('引数は `f(self=攻撃側, command, side)` である')).toEqual([])
+})
+
 test('checkVocabulary は Markdown のコードブロックの中を検査しない', () => {
   const text = ['変更の内容を書く', '```', 'エラー: 接続が落ちる', '```'].join('\n')
   expect(checkVocabulary(text)).toEqual([])
