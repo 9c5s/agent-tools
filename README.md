@@ -41,11 +41,25 @@ agent-tools/
 │   ├── hooks/
 │   ├── scripts/
 │   └── settings.json
+├── tests/                            # hook のテスト
+├── biome.json                        # lint とフォーマットの設定
+├── tsconfig.json                     # 型チェックの設定
+├── package.json
 ├── README.md
 └── LICENSE
 ```
 
 `.claude/` は作者本人の個人設定であり、`/plugin install` の対象外。GitHub 上では公開されているが、他ユーザーがインストールすることはない。
+
+## 開発
+
+`.claude/` 配下のスクリプトとテストは TypeScript で書く。Biome が lint とフォーマット、tsc が型チェックを担当する。
+
+```
+bun install
+bun run check      # lint、型チェック、テストを順に実行
+bun run lint:fix   # フォーマットと自動修正を適用
+```
 
 ## ライセンス
 

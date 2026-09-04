@@ -1,0 +1,15 @@
+{
+  "name": "agent-tools",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "lint": "bunx biome check .",
+    "lint:fix": "bunx biome check --write .",
+    "typecheck": "bunx tsc --noEmit",
+    "test": "bun test",
+    "check": "bun run lint && bun run typecheck && bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0"
+  }
+}

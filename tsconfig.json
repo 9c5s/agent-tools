@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "types": ["bun"],
+    "lib": ["ESNext"],
+    "target": "ESNext",
+    "module": "preserve",
+    "moduleResolution": "bundler",
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "verbatimModuleSyntax": true,
+    "noUncheckedIndexedAccess": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": [".claude/hooks/**/*.ts", ".claude/scripts/**/*.ts", "tests/**/*.ts"]
+}
