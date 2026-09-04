@@ -218,9 +218,10 @@ export function blockMessage(reason: string): string {
 // payload が読めない場合は許可する (hook 自体の不具合でツール実行を止めないため)
 if (import.meta.main) {
   try {
-    const payload = JSON.parse(
-      await new Response(Bun.stdin.stream()).text(),
-    ) as Record<string, unknown>
+    const payload = JSON.parse(await new Response(Bun.stdin.stream()).text()) as Record<
+      string,
+      unknown
+    >
     const result = inspect(payload.tool_name, payload.tool_input)
     if (result.block !== null) {
       process.stderr.write(blockMessage(result.block))

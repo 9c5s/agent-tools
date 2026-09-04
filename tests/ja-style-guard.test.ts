@@ -1,8 +1,9 @@
 // ja-style-guard: off
+
+import { expect, test } from 'bun:test'
 import { rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { test, expect } from 'bun:test'
 import {
   blockMessage,
   checkDescription,
@@ -21,7 +22,9 @@ test('checkDescription はカタカナのみの description を許可する', ()
 })
 
 test('checkDescription は技術用語混じりの日本語を許可する', () => {
-  expect(checkDescription('PowerShell', { command: 'gh pr view 1', description: 'PR #1 を確認' })).toBeNull()
+  expect(
+    checkDescription('PowerShell', { command: 'gh pr view 1', description: 'PR #1 を確認' }),
+  ).toBeNull()
 })
 
 test('checkDescription は英語のみの description を拒否する', () => {
@@ -250,7 +253,9 @@ test('warningPayload は additionalContext を持つ PreToolUse の JSON を返�
 
 test('warningPayload は監査で追えるマーカーを先頭に付ける', () => {
   const payload = JSON.parse(warningPayload(['指摘 A']))
-  expect(payload.hookSpecificOutput.additionalContext.startsWith('[ja-style-guard:warn]')).toBe(true)
+  expect(payload.hookSpecificOutput.additionalContext.startsWith('[ja-style-guard:warn]')).toBe(
+    true,
+  )
 })
 
 test('blockMessage は監査で追えるマーカーを先頭に付ける', () => {
