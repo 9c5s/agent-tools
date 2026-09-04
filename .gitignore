@@ -1,7 +1,4 @@
 !.claude/
 .claude/plugins/cache/
 .claude/plugins/backups/
-.claude/hooks/watch-launch.ts
-.claude/hooks/watch-stop.ts
-.claude/scripts/statusline-tee.ts
 .agents/skills/synced/

@@ -84,31 +84,11 @@
           }
         ]
       }
-    ],
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun ~/.claude/hooks/watch-launch.ts"
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun ~/.claude/hooks/watch-stop.ts"
-          }
-        ]
-      }
     ]
   },
   "statusLine": {
     "type": "command",
-    "command": "bun ~/.claude/scripts/statusline-tee.ts uv run ~/.claude/scripts/statusline.py --icons=nerd",
+    "command": "uv run ~/.claude/scripts/statusline.py --icons=nerd",
     "padding": 0
   },
   "enabledPlugins": {
