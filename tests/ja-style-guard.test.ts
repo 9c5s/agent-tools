@@ -429,3 +429,8 @@ test('checkVocabulary は年月日時分秒以外の助数詞の直前の数字�
   expect(checkVocabulary('3回押す').join('')).toContain('境界')
   expect(checkVocabulary('162バイト読む').join('')).toContain('境界')
 })
+
+test('checkVocabulary は真因と配線を造語として警告する', () => {
+  expect(checkVocabulary('真因を特定する').join('')).toContain('真因')
+  expect(checkVocabulary('モジュール間の配線を確認する').join('')).toContain('配線')
+})
