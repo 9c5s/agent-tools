@@ -140,6 +140,10 @@ const VOCABULARY_RULES: { pattern: RegExp; hint: string }[] = [
     hint: '過剰な丁寧語を使わない (します です に直す)',
   },
   {
+    pattern: /真因|配線/gu,
+    hint: '比喩や直訳の造語を使わない (根本原因 接続 のような標準的な語に直す)',
+  },
+  {
     pattern: JA_ASCII_RE,
     hint: '日本語と英数字の境界には半角スペースを入れる',
   },
