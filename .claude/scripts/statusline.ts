@@ -2,6 +2,19 @@
 // statusline フックから stdin で受け取った JSON を、プロジェクト情報やレートリミットの行に整形して出力する
 // 入力 JSON の構造: https://code.claude.com/docs/en/statusline
 
+import {
+  chmodSync,
+  closeSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+
 // stdin の JSON はこの型で受け取り、各セグメントが必要なフィールドの型を検査する
 export type Input = Record<string, unknown>
 
@@ -164,4 +177,168 @@ export function formatAmount(value: number, decimals: number): string {
   const [intPart = '', fracPart] = fixedHalfEven(value, decimals).split('.')
   const grouped = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ',')
   return fracPart === undefined ? grouped : `${grouped}.${fracPart}`
+}
+
+const SUBPROCESS_TIMEOUT_MS = 3000
+
+export type RefreshSpawnOptions = { windowsHide?: boolean; detached?: boolean }
+
+// 副作用の入口。テストは一時ディレクトリと偽の関数を差し込む
+export type Env = {
+  now: () => number // epoch 秒 (キャッシュの _cached_at や resets_at と単位を揃える)
+  tmpDir: () => string
+  homeDir: () => string
+  locale: () => string // BCP 47
+  realpath: (path: string) => string
+  fetch: (input: string | URL | Request, init?: RequestInit) => Promise<Response>
+  spawnSync: (cmd: string[], cwd?: string) => { exitCode: number; stdout: string }
+  spawn: (cmd: string[], options: RefreshSpawnOptions) => void
+  stderr: (text: string) => void
+}
+
+export const defaultEnv: Env = {
+  now: () => Date.now() / 1000,
+  tmpDir: () => tmpdir(),
+  homeDir: () => homedir(),
+  locale: () => Intl.DateTimeFormat().resolvedOptions().locale,
+  realpath: (path) => realpathSync.native(path),
+  fetch: (input, init) => fetch(input, init),
+  spawnSync: (cmd, cwd) => {
+    const result = Bun.spawnSync(cmd, {
+      cwd,
+      stdout: 'pipe',
+      stderr: 'ignore',
+      timeout: SUBPROCESS_TIMEOUT_MS,
+    })
+    return { exitCode: result.exitCode, stdout: result.stdout.toString() }
+  },
+  spawn: (cmd, options) => {
+    Bun.spawn(cmd, { ...options, stdio: ['ignore', 'ignore', 'ignore'] }).unref()
+  },
+  stderr: (text) => {
+    process.stderr.write(text)
+  },
+}
+
+// 表示の設定。main が引数から組み立てて各セグメントへ渡す
+export type Ctx = { icons: Icons; currency: string; env: Env }
+
+// キャッシュのファイル名は Python 版と同じにし、既存のファイルを引き継ぐ
+export const CACHE_FILES = {
+  git: 'claude-git-cache.json',
+  exchange: 'claude-exchange-cache.json',
+  sessionCost: 'claude-session-cost.json',
+  dailyCost: 'claude-daily-cost.json',
+  modelUsage: 'claude-model-usage.json',
+} as const
+
+export function cachePath(env: Env, name: (typeof CACHE_FILES)[keyof typeof CACHE_FILES]): string {
+  return join(env.tmpDir(), name)
+}
+
+// ローカル日付を YYYY-MM-DD にする
+export function today(env: Env): string {
+  const date = new Date(env.now() * 1000)
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`
+}
+
+export type CacheObject = Record<string, unknown>
+
+// キャッシュファイルを読む (無い、壊れている場合は空のオブジェクト)
+export function readCacheObject(path: string): CacheObject {
+  try {
+    const obj: unknown = JSON.parse(readFileSync(path, 'utf8'))
+    return isRecord(obj) ? obj : {}
+  } catch {
+    return {}
+  }
+}
+
+export function cacheKeyMatches(cache: CacheObject, cacheKey?: Record<string, string>): boolean {
+  if (!cacheKey) return true
+  return Object.entries(cacheKey).every(([key, value]) => cache[key] === value)
+}
+
+// 一時ファイルに書いてから rename する (書き込み途中の内容を他プロセスに読ませない)
+export function writeCache(path: string, obj: CacheObject): void {
+  const suffix = `${process.pid}-${Math.random().toString(36).slice(2)}`
+  const tmp = join(dirname(path), `claude-cache-${suffix}.tmp`)
+  try {
+    writeFileSync(tmp, JSON.stringify(obj), 'utf8')
+    renameSync(tmp, path)
+  } catch {
+    try {
+      unlinkSync(tmp)
+    } catch {
+      // 一時ファイルが作れていなければ消すものも無い
+    }
+    return
+  }
+  try {
+    chmodSync(path, 0o600)
+  } catch {
+    // 権限を変えられないファイルシステムでは無視する
+  }
+}
+
+// <path>.lock を排他的に作って read-modify-write を直列化する
+// timeoutMs 内に取得できなければ、可用性を優先してロック無しで実行する
+export function withFileLock<T>(path: string, fn: () => T, timeoutMs = 1000): T {
+  const lockPath = `${path}.lock`
+  const deadline = Date.now() + timeoutMs
+  let fd: number | null = null
+  while (Date.now() < deadline) {
+    try {
+      fd = openSync(lockPath, 'wx')
+      break
+    } catch {
+      Bun.sleepSync(10)
+    }
+  }
+  try {
+    return fn()
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd)
+      } catch {
+        // 閉じられなくても解放は続ける
+      }
+      try {
+        unlinkSync(lockPath)
+      } catch {
+        // 既に無ければよい
+      }
+    }
+  }
+}
+
+export type CachedFetchOptions<T> = {
+  path: string
+  ttl: number // 秒
+  fetch: () => Promise<T | null>
+  isValid: (value: unknown) => value is T
+  cacheKey?: Record<string, string>
+}
+
+// TTL 内かつ cacheKey が一致するキャッシュを返し、無ければ取得して保存する
+// 取得に失敗したときは期限切れのキャッシュを返す
+export async function cachedFetch<T>(env: Env, options: CachedFetchOptions<T>): Promise<T | null> {
+  const now = env.now()
+  const cache = readCacheObject(options.path)
+  const cached = cache.data
+  let expired: T | null = null
+  if (cacheKeyMatches(cache, options.cacheKey) && options.isValid(cached)) {
+    expired = cached
+    if (now - (safeFloat(cache._cached_at) ?? 0) < options.ttl) return cached
+  }
+  let data: T | null
+  try {
+    data = await options.fetch()
+  } catch {
+    return expired
+  }
+  if (data === null) return expired
+  writeCache(options.path, { ...options.cacheKey, _cached_at: now, data })
+  return data
 }
