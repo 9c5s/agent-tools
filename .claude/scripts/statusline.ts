@@ -693,10 +693,10 @@ export function markUsageAttempt(env: Env, now: number): void {
   })
 }
 
-// Windows は CREATE_NO_WINDOW に当たる windowsHide だけを付ける
-// (DETACHED_PROCESS と併用すると CREATE_NO_WINDOW は無視される)
+// detached を付けないと Windows では親の終了時に子も終了させられる
+// (デタッチしない子は親の job object に入り、親のハンドルが閉じると kill される)
 export function refreshSpawnOptions(platform: string): RefreshSpawnOptions {
-  return platform === 'win32' ? { windowsHide: true } : { detached: true }
+  return platform === 'win32' ? { detached: true, windowsHide: true } : { detached: true }
 }
 
 // 使用量キャッシュを更新する子プロセスを起動する (結果は待たず次回の描画で反映する)
