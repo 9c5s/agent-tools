@@ -1163,3 +1163,250 @@ describe('refreshModelUsage', () => {
     expect(cache._attempted_at).toBe(NOW)
   })
 })
+
+describe('getCwd', () => {
+  test('workspace.current_dir を優先する', () => {
+    expect(sl.getCwd({ cwd: '/a', workspace: { current_dir: '/b' } })).toBe('/b')
+  })
+
+  test('current_dir が無い、workspace がオブジェクトでない場合は cwd', () => {
+    expect(sl.getCwd({ cwd: '/a', workspace: {} })).toBe('/a')
+    expect(sl.getCwd({ cwd: '/a', workspace: 'x' })).toBe('/a')
+    expect(sl.getCwd({ cwd: '/a' })).toBe('/a')
+  })
+
+  test('どちらも無ければ空文字', () => {
+    expect(sl.getCwd({})).toBe('')
+    expect(sl.getCwd({ cwd: 123 })).toBe('')
+  })
+})
+
+describe('segProject', () => {
+  test('ディレクトリ名を file URL へのリンクにして青で表示する', () => {
+    const dir = join(makeDir(), 'myproject')
+    mkdirSync(dir)
+    const ctx = makeCtx()
+    const text = sl.segProject({ cwd: dir }, ctx)
+    expect(text).toContain('myproject')
+    expect(text).toContain(sl.fileUri(ctx.env.realpath(dir)))
+    expect(text.startsWith(`\x1b[34m${sl.ICONS_EMOJI.folder} `)).toBe(true)
+  })
+
+  test('相対パスは実行時のカレントディレクトリ基準で絶対化する', () => {
+    const text = sl.segProject({ cwd: 'relative/path/myproject' }, makeCtx())
+    expect(text).toContain('myproject')
+    expect(text).toContain('file://')
+  })
+
+  test('cwd が空なら unknown でリンク無し', () => {
+    const text = sl.segProject({}, makeCtx())
+    expect(text).toContain('unknown')
+    expect(text).not.toContain('file://')
+  })
+
+  test('. と .. は絶対化した後の名前を表示する', () => {
+    expect(sl.segProject({ cwd: '.' }, makeCtx())).toContain(sl.fileUri(process.cwd()))
+    const parentName = process.cwd().split(/[\\/]/).slice(0, -1).pop() ?? ''
+    expect(sl.segProject({ cwd: '..' }, makeCtx())).toContain(parentName)
+  })
+
+  test('存在しないパスは絶対化だけしてリンクを付ける', () => {
+    const missing = join(makeDir(), 'missing', 'proj')
+    const stderr = mock((_text: string) => undefined)
+    const text = sl.segProject({ cwd: missing }, makeCtx({ env: makeEnv({ stderr }) }))
+    expect(text).toContain('proj')
+    expect(text).toContain('file://')
+    expect(stderr).not.toHaveBeenCalled()
+  })
+
+  test('realpath がそれ以外の理由で失敗したら stderr に診断を出しリンクを付けない', () => {
+    const stderr = mock((_text: string) => undefined)
+    const env = makeEnv({
+      stderr,
+      realpath: () => {
+        throw new Error('uri build error')
+      },
+    })
+    const text = sl.segProject({ cwd: join(makeDir(), 'myproject') }, makeCtx({ env }))
+    expect(text).toContain('myproject')
+    expect(text).not.toContain('file://')
+    const message = stderr.mock.calls[0]?.[0] ?? ''
+    expect(message).toContain('statusline:')
+    expect(message).toContain('uri build error')
+  })
+
+  test('成功時は stderr に何も出さない', () => {
+    const stderr = mock((_text: string) => undefined)
+    sl.segProject({ cwd: makeDir() }, makeCtx({ env: makeEnv({ stderr }) }))
+    expect(stderr).not.toHaveBeenCalled()
+  })
+})
+
+describe('segBranch', () => {
+  test('ブランチ名を黄で表示し、リモートがあればブランチページへのリンクにする', async () => {
+    const git = fakeGit({
+      'rev-parse --abbrev-ref HEAD': { exitCode: 0, stdout: 'main\n' },
+      'remote get-url origin': { exitCode: 0, stdout: 'git@github.com:user/repo.git\n' },
+    })
+    const ctx = makeCtx({ env: makeEnv({ spawnSync: git.spawnSync }) })
+    const text = await sl.segBranch({ cwd: '/some/path' }, ctx)
+    expect(text).toBe(
+      sl.colorize(
+        `${sl.ICONS_EMOJI.branch} ${sl.osc8Link('https://github.com/user/repo/tree/main', 'main')}`,
+        sl.Color.yellow,
+      ),
+    )
+  })
+
+  test('リモートが無い、または対応しないプロトコルならリンク無し', async () => {
+    const noRemote = fakeGit({ 'rev-parse --abbrev-ref HEAD': { exitCode: 0, stdout: 'main\n' } })
+    expect(
+      await sl.segBranch(
+        { cwd: '/p' },
+        makeCtx({ env: makeEnv({ spawnSync: noRemote.spawnSync }) }),
+      ),
+    ).toBe(sl.colorize(`${sl.ICONS_EMOJI.branch} main`, sl.Color.yellow))
+    const svn = fakeGit({
+      'rev-parse --abbrev-ref HEAD': { exitCode: 0, stdout: 'main\n' },
+      'remote get-url origin': { exitCode: 0, stdout: 'svn://example.com/repo\n' },
+    })
+    expect(
+      await sl.segBranch({ cwd: '/p' }, makeCtx({ env: makeEnv({ spawnSync: svn.spawnSync }) })),
+    ).not.toContain('\x1b]8;;')
+  })
+
+  test('cwd が無い、git が無い場合は null', async () => {
+    expect(await sl.segBranch({}, makeCtx())).toBeNull()
+    expect(await sl.segBranch({ cwd: '/p' }, makeCtx())).toBeNull()
+  })
+
+  test('キャッシュがあれば git を実行しない', async () => {
+    const git = fakeGit({})
+    const env = makeEnv({ spawnSync: git.spawnSync })
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.git), {
+      _cached_at: NOW,
+      data: { branch: 'cached' },
+      cwd: '/p',
+    })
+    expect(await sl.segBranch({ cwd: '/p' }, makeCtx({ env }))).toContain('cached')
+    expect(git.calls).toEqual([])
+  })
+})
+
+describe('segModel', () => {
+  const model = (displayName: string, id: string, effort?: unknown): sl.Input => ({
+    model: { display_name: displayName, id },
+    ...(effort === undefined ? {} : { effort }),
+  })
+
+  test('display_name とバージョンを表示する', () => {
+    expect(sl.segModel(model('Opus', 'claude-opus-4-6'), makeCtx())).toBe(
+      `${sl.ICONS_EMOJI.model} Opus 4.6`,
+    )
+  })
+
+  test('model が無い、オブジェクトでない、display_name が無い場合は null', () => {
+    expect(sl.segModel({}, makeCtx())).toBeNull()
+    expect(sl.segModel({ model: 'string' }, makeCtx())).toBeNull()
+    expect(sl.segModel({ model: { id: 'claude-opus-4-6' } }, makeCtx())).toBeNull()
+  })
+
+  test('display_name にバージョンが含まれていれば重複させない', () => {
+    expect(sl.segModel(model('Opus 4.6', 'claude-opus-4-6'), makeCtx())).toBe(
+      `${sl.ICONS_EMOJI.model} Opus 4.6`,
+    )
+  })
+
+  test('" context)" で終わる括弧は表示しない', () => {
+    expect(sl.segModel(model('Opus 4.6 (1M context)', 'claude-opus-4-6'), makeCtx())).toBe(
+      `${sl.ICONS_EMOJI.model} Opus 4.6`,
+    )
+    expect(
+      sl.segModel(model('Sonnet 4.5 (200K context)', 'claude-sonnet-4-5-20250514'), makeCtx()),
+    ).toBe(`${sl.ICONS_EMOJI.model} Sonnet 4.5`)
+    expect(sl.segModel(model('Opus (1M context context)', 'claude-opus-4-7'), makeCtx())).toBe(
+      `${sl.ICONS_EMOJI.model} Opus 4.7`,
+    )
+  })
+
+  test('それ以外の括弧は保つ', () => {
+    expect(sl.segModel(model('Opus (preview)', 'claude-opus-4-7'), makeCtx())).toBe(
+      `${sl.ICONS_EMOJI.model} Opus 4.7 (preview)`,
+    )
+  })
+
+  test('バージョンが取れなければ display_name だけ', () => {
+    expect(sl.segModel(model('CustomModel', 'custom'), makeCtx())).toBe(
+      `${sl.ICONS_EMOJI.model} CustomModel`,
+    )
+  })
+
+  test('effort.level を末尾に付ける', () => {
+    expect(
+      sl.segModel(model('Opus (1M context)', 'claude-opus-4-7', { level: 'high' }), makeCtx()),
+    ).toBe(`${sl.ICONS_EMOJI.model} Opus 4.7 high`)
+  })
+
+  test('effort が無い、オブジェクトでない場合は付けない', () => {
+    expect(sl.segModel(model('Sonnet', 'claude-sonnet-4-6'), makeCtx())).toBe(
+      `${sl.ICONS_EMOJI.model} Sonnet 4.6`,
+    )
+    expect(sl.segModel(model('Opus', 'claude-opus-4-7', 'high'), makeCtx())).toBe(
+      `${sl.ICONS_EMOJI.model} Opus 4.7`,
+    )
+  })
+})
+
+describe('segContext', () => {
+  test('使用率を整数の % で色付きに表示する', () => {
+    expect(sl.segContext({ context_window: { used_percentage: 45.7 } }, makeCtx())).toBe(
+      `${sl.ICONS_EMOJI.chart} ${sl.colorize('45%', sl.Color.green)}`,
+    )
+  })
+
+  test('利用率に応じて色が変わる', () => {
+    expect(sl.segContext({ context_window: { used_percentage: 85 } }, makeCtx())).toContain(
+      '\x1b[31m',
+    )
+    expect(sl.segContext({ context_window: { used_percentage: 65 } }, makeCtx())).toContain(
+      '\x1b[33m',
+    )
+    expect(sl.segContext({ context_window: { used_percentage: 30 } }, makeCtx())).toContain(
+      '\x1b[32m',
+    )
+  })
+
+  test('context_window や used_percentage が無い、数値でない、有限でない場合は null', () => {
+    expect(sl.segContext({}, makeCtx())).toBeNull()
+    expect(sl.segContext({ context_window: 'x' }, makeCtx())).toBeNull()
+    expect(sl.segContext({ context_window: {} }, makeCtx())).toBeNull()
+    expect(sl.segContext({ context_window: { used_percentage: 'abc' } }, makeCtx())).toBeNull()
+    expect(sl.segContext({ context_window: { used_percentage: Number.NaN } }, makeCtx())).toBeNull()
+    expect(
+      sl.segContext({ context_window: { used_percentage: Number.POSITIVE_INFINITY } }, makeCtx()),
+    ).toBeNull()
+  })
+})
+
+describe('segLines', () => {
+  test('追加行を緑、削除行を赤で表示する', () => {
+    const data = { cost: { total_lines_added: 156, total_lines_removed: 23 } }
+    expect(sl.segLines(data, makeCtx())).toBe(
+      `${sl.ICONS_EMOJI.pencil} ${sl.colorize('+156', sl.Color.green)}/${sl.colorize('-23', sl.Color.red)}`,
+    )
+  })
+
+  test('片方だけでも表示する', () => {
+    expect(sl.segLines({ cost: { total_lines_added: 10 } }, makeCtx())).toContain('+10')
+    expect(sl.segLines({ cost: { total_lines_added: 10 } }, makeCtx())).toContain('-0')
+  })
+
+  test('変更が 0 行、cost が無い、オブジェクトでない、数値でない場合は null', () => {
+    expect(
+      sl.segLines({ cost: { total_lines_added: 0, total_lines_removed: 0 } }, makeCtx()),
+    ).toBeNull()
+    expect(sl.segLines({}, makeCtx())).toBeNull()
+    expect(sl.segLines({ cost: 'x' }, makeCtx())).toBeNull()
+    expect(sl.segLines({ cost: { total_lines_added: 'abc' } }, makeCtx())).toBeNull()
+  })
+})
