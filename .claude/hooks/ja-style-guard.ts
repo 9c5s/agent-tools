@@ -58,21 +58,25 @@ function stripCodeBlocks(text: string): string {
     .join('\n')
 }
 
-// 箇条書きとコメント見出しのラベルと説明を区切る em ダッシュを取り除く
+// 箇条書き コメント見出し 番号付きリスト docstring のラベルと説明を区切る em ダッシュを取り除く
 // 索引や項目の一覧 ファイル冒頭の見出しで広く使われている書式で 地の文のダッシュとは役割が違う
+// 表のセルだけのダッシュは空欄の印なので同様に外す
 // 2 倍ダッシュと それ以外の行のダッシュは残して検知させる
-const LABEL_LINE_RE = /^\s*(?:[-*]|\/\/|#+) /
+const LABEL_LINE_RE = /^\s*(?:(?:[-*]|\/\/|#+|\d+\.) |"""|''')/
 
 function stripListLabelDash(text: string): string {
   return text
     .split('\n')
-    .map((line) => (LABEL_LINE_RE.test(line) ? line.replace(/(?<!—) — (?!—)/gu, ' ') : line))
+    .map((line) => {
+      const cell = line.replace(/\|\s*—\s*(?=\|)/gu, '|')
+      return LABEL_LINE_RE.test(cell) ? cell.replace(/(?<!—) — (?!—)/gu, ' ') : cell
+    })
     .join('\n')
 }
 
-// 括弧の内側の半角カンマを空白にする (タプルや引数の列挙は日本語文の読点ではない)
+// 括弧と角括弧の内側の半角カンマを空白にする (タプルや配列や引数の列挙は日本語文の読点ではない)
 function stripParenCommas(text: string): string {
-  return text.replace(/[(（][^()（）]*[)）]/gu, (part) => part.replace(/,/gu, ' '))
+  return text.replace(/[(（[][^()（）[\]]*[)）\]]/gu, (part) => part.replace(/,/gu, ' '))
 }
 
 // インラインコードを取り除く (識別子や書式例を地の文として検査しないため)

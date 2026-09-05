@@ -397,3 +397,18 @@ test('checkVocabulary は Python の定義名の内部の境界を警告しな�
 test('checkVocabulary は定義行でもコメントの境界は警告する', () => {
   expect(checkVocabulary('def run(self):  # fileを返す').join('')).toContain('境界')
 })
+
+test('checkNotation は角括弧の内側の列挙の半角カンマを検知しない', () => {
+  expect(checkNotation('[10分, 30分] の一様分布で待つ')).toEqual([])
+})
+
+test('checkNotation は docstring と番号付きリストのラベル区切りの em ダッシュを検知しない', () => {
+  expect(
+    checkNotation('"""api モジュールのテスト — 保存した実レスポンスのパースを検証する。"""'),
+  ).toEqual([])
+  expect(checkNotation('2. **dryrun でレポート生成** — 以下を出力する')).toEqual([])
+})
+
+test('checkNotation は表のセルだけの em ダッシュを検知しない', () => {
+  expect(checkNotation('| `filePath` | 対応 | — | 限定 |')).toEqual([])
+})
