@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 
 // stdin の JSON はこの型で受け取り、各セグメントが必要なフィールドの型を検査する
 export type Input = Record<string, unknown>
@@ -744,4 +744,111 @@ export async function refreshModelUsage(env: Env): Promise<void> {
     }
     writeCache(path, cache)
   })
+}
+
+// workspace.current_dir を優先し、無ければ cwd を使う
+export function getCwd(data: Input): string {
+  const workspace = data.workspace
+  if (isRecord(workspace) && typeof workspace.current_dir === 'string' && workspace.current_dir) {
+    return workspace.current_dir
+  }
+  return typeof data.cwd === 'string' ? data.cwd : ''
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+// 絶対化して symlink を解決する。存在しないパスは絶対化だけ行う
+function resolveRealPath(path: string, env: Env): string {
+  const absolute = resolve(path)
+  try {
+    return env.realpath(absolute)
+  } catch (error) {
+    if (isRecord(error) && error.code === 'ENOENT') return absolute
+    throw error
+  }
+}
+
+// プロジェクト名 (cwd の末尾) を file URL へのリンクにする
+// URL を作れないときは stderr に診断を出し、リンク無しで表示する (stdout は表示に使う)
+export function segProject(data: Input, ctx: Ctx): string {
+  const cwd = getCwd(data)
+  let name = basename(cwd) || 'unknown'
+  let url: string | null = null
+  if (cwd) {
+    try {
+      const resolved = resolveRealPath(cwd, ctx.env)
+      url = fileUri(resolved)
+      name = basename(resolved) || name
+    } catch (error) {
+      ctx.env.stderr(
+        `statusline: cannot build file URI from cwd=${JSON.stringify(cwd)}: ${errorMessage(error)}\n`,
+      )
+    }
+  }
+  const label = url ? osc8Link(url, name) : name
+  return colorize(`${ctx.icons.folder} ${label}`, Color.blue)
+}
+
+// ブランチ名を表示し、リモートがあればブランチページへのリンクにする
+export async function segBranch(data: Input, ctx: Ctx): Promise<string | null> {
+  const cwd = getCwd(data)
+  if (!cwd) return null
+  const git = await getGitInfo(cwd, ctx.env)
+  if (!git?.branch) return null
+  const repo = git.remote_url ? remoteToHttps(git.remote_url) : null
+  const label = repo ? osc8Link(`${repo}/tree/${git.branch}`, git.branch) : git.branch
+  return colorize(`${ctx.icons.branch} ${label}`, Color.yellow)
+}
+
+// "base version (paren) effort" の順で組み立てる
+// " context)" で終わる括弧はコンテキスト長の表記なので表示しない
+export function segModel(data: Input, ctx: Ctx): string | null {
+  const model = data.model
+  if (!isRecord(model)) return null
+  const displayName = typeof model.display_name === 'string' ? model.display_name : ''
+  const modelId = typeof model.id === 'string' ? model.id : ''
+  if (!displayName) return null
+  let base = displayName
+  let paren = ''
+  const parenIndex = displayName.indexOf('(')
+  if (parenIndex >= 0) {
+    base = displayName.slice(0, parenIndex).trimEnd()
+    paren = displayName.slice(parenIndex)
+    if (paren.endsWith(' context)')) paren = ''
+  }
+  const version = extractVersion(modelId)
+  const parts = [base]
+  if (version && !base.includes(version)) parts.push(version)
+  if (paren) parts.push(paren)
+  const effort = data.effort
+  if (isRecord(effort) && effort.level) parts.push(String(effort.level))
+  return `${ctx.icons.model} ${parts.join(' ')}`
+}
+
+// コンテキストウィンドウの使用率
+export function segContext(data: Input, ctx: Ctx): string | null {
+  const window = data.context_window
+  if (
+    !isRecord(window) ||
+    window.used_percentage === undefined ||
+    window.used_percentage === null
+  ) {
+    return null
+  }
+  const pct = safeFloat(window.used_percentage)
+  if (pct === null || !Number.isFinite(pct)) return null
+  return `${ctx.icons.chart} ${colorize(`${Math.trunc(pct)}%`, colorForUtilization(pct))}`
+}
+
+// 変更行数 (追加と削除の両方が 0 なら表示しない)
+export function segLines(data: Input, ctx: Ctx): string | null {
+  const cost = data.cost
+  if (!isRecord(cost)) return null
+  const added = safeInt(cost.total_lines_added === undefined ? 0 : cost.total_lines_added)
+  const removed = safeInt(cost.total_lines_removed === undefined ? 0 : cost.total_lines_removed)
+  if (added === null || removed === null) return null
+  if (added === 0 && removed === 0) return null
+  return `${ctx.icons.pencil} ${colorize(`+${added}`, Color.green)}/${colorize(`-${removed}`, Color.red)}`
 }
