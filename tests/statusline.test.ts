@@ -1,5 +1,58 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, mock, test } from 'bun:test'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import * as sl from '../.claude/scripts/statusline'
+
+const tempDirs: string[] = []
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+})
+
+function makeDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'statusline-test-'))
+  tempDirs.push(dir)
+  return dir
+}
+
+// 2025-06-15T15:06:40Z
+const NOW = 1_750_000_000
+
+// 既定では HTTP と git は失敗し、子プロセスは起動せず、stderr は捨てる
+function makeEnv(overrides: Partial<sl.Env> = {}): sl.Env {
+  const dir = makeDir()
+  return {
+    now: () => NOW,
+    tmpDir: () => dir,
+    homeDir: () => dir,
+    locale: () => 'en-US',
+    realpath: sl.defaultEnv.realpath,
+    fetch: () => Promise.reject(new Error('network disabled')),
+    spawnSync: () => {
+      throw new Error('git disabled')
+    },
+    spawn: () => undefined,
+    stderr: () => undefined,
+    ...overrides,
+  }
+}
+
+function writeJson(path: string, value: unknown): void {
+  writeFileSync(path, JSON.stringify(value), 'utf8')
+}
+
+function readJson(path: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
+}
 
 describe('safeFloat', () => {
   test('数値と数値文字列を受け付ける', () => {
@@ -189,5 +242,213 @@ describe('formatAmount', () => {
 
   test('負の値も扱える', () => {
     expect(sl.formatAmount(-1234.5, 2)).toBe('-1,234.50')
+  })
+})
+
+describe('today', () => {
+  test('env.now のローカル日付を YYYY-MM-DD にする', () => {
+    const local = new Date(2026, 5, 26, 12, 0)
+    const env = makeEnv({ now: () => local.getTime() / 1000 })
+    expect(sl.today(env)).toBe('2026-06-26')
+  })
+})
+
+describe('cachePath', () => {
+  test('env.tmpDir の下にキャッシュファイルを置く', () => {
+    const env = makeEnv()
+    expect(sl.cachePath(env, sl.CACHE_FILES.git)).toBe(join(env.tmpDir(), 'claude-git-cache.json'))
+  })
+})
+
+describe('readCacheObject', () => {
+  test('JSON オブジェクトを返す', () => {
+    const path = join(makeDir(), 'c.json')
+    writeJson(path, { a: 1 })
+    expect(sl.readCacheObject(path)).toEqual({ a: 1 })
+  })
+
+  test('無い、壊れている、オブジェクトでない場合は空のオブジェクト', () => {
+    const dir = makeDir()
+    expect(sl.readCacheObject(join(dir, 'absent.json'))).toEqual({})
+    writeFileSync(join(dir, 'broken.json'), '{oops', 'utf8')
+    expect(sl.readCacheObject(join(dir, 'broken.json'))).toEqual({})
+    writeJson(join(dir, 'list.json'), [1, 2])
+    expect(sl.readCacheObject(join(dir, 'list.json'))).toEqual({})
+  })
+})
+
+describe('cacheKeyMatches', () => {
+  test('キーが無ければ常に一致', () => {
+    expect(sl.cacheKeyMatches({ a: 'x' })).toBe(true)
+    expect(sl.cacheKeyMatches({ a: 'x' }, {})).toBe(true)
+  })
+
+  test('すべての値が一致すれば true', () => {
+    expect(sl.cacheKeyMatches({ a: 'x', b: 'y', c: 1 }, { a: 'x', b: 'y' })).toBe(true)
+  })
+
+  test('値が違う、または欠けていれば false', () => {
+    expect(sl.cacheKeyMatches({ a: 'x' }, { a: 'z' })).toBe(false)
+    expect(sl.cacheKeyMatches({ a: 'x' }, { a: 'x', b: 'y' })).toBe(false)
+  })
+})
+
+describe('writeCache', () => {
+  test('JSON を書き、既存のファイルを置き換える', () => {
+    const path = join(makeDir(), 'c.json')
+    sl.writeCache(path, { v: 1 })
+    sl.writeCache(path, { v: 2 })
+    expect(readJson(path)).toEqual({ v: 2 })
+  })
+
+  test('rename に失敗したら一時ファイルを残さない', () => {
+    const dir = makeDir()
+    // 同名のディレクトリがあると rename に失敗する
+    const target = join(dir, 'cache.json')
+    mkdirSync(target)
+    sl.writeCache(target, { key: 'value' })
+    expect(readdirSync(dir).filter((name) => name.startsWith('claude-cache-'))).toEqual([])
+  })
+})
+
+describe('withFileLock', () => {
+  test('ロックを作り、関数の戻り値を返し、終了時に消す', () => {
+    const path = join(makeDir(), 'cache.json')
+    const lock = `${path}.lock`
+    const result = sl.withFileLock(path, () => {
+      expect(existsSync(lock)).toBe(true)
+      return 42
+    })
+    expect(result).toBe(42)
+    expect(existsSync(lock)).toBe(false)
+  })
+
+  test('既存のロックがあるとタイムアウト後に実行し、そのロックは消さない', () => {
+    const path = join(makeDir(), 'cache.json')
+    const lock = `${path}.lock`
+    writeFileSync(lock, '', 'utf8')
+    const fn = mock(() => 'ran')
+    expect(sl.withFileLock(path, fn, 50)).toBe('ran')
+    expect(fn).toHaveBeenCalledTimes(1)
+    expect(existsSync(lock)).toBe(true)
+  })
+
+  test('関数が例外を投げてもロックを消す', () => {
+    const path = join(makeDir(), 'cache.json')
+    expect(() =>
+      sl.withFileLock(path, () => {
+        throw new Error('boom')
+      }),
+    ).toThrow('boom')
+    expect(existsSync(`${path}.lock`)).toBe(false)
+  })
+})
+
+describe('cachedFetch', () => {
+  const isNumber = (v: unknown): v is number => typeof v === 'number'
+
+  function options(
+    path: string,
+    fetch: () => Promise<number | null>,
+    cacheKey?: Record<string, string>,
+  ) {
+    return { path, ttl: 60, fetch, isValid: isNumber, cacheKey }
+  }
+
+  test('キャッシュが無ければ取得して保存する', async () => {
+    const env = makeEnv()
+    const path = join(env.tmpDir(), 'c.json')
+    expect(
+      await sl.cachedFetch(
+        env,
+        options(path, async () => 7),
+      ),
+    ).toBe(7)
+    expect(readJson(path)).toEqual({ _cached_at: NOW, data: 7 })
+  })
+
+  test('TTL 内のキャッシュを返し取得しない', async () => {
+    const env = makeEnv()
+    const path = join(env.tmpDir(), 'c.json')
+    writeJson(path, { _cached_at: NOW - 10, data: 5 })
+    const fetch = mock(async () => 9)
+    expect(await sl.cachedFetch(env, options(path, fetch))).toBe(5)
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  test('TTL 切れなら取得し直す', async () => {
+    const env = makeEnv()
+    const path = join(env.tmpDir(), 'c.json')
+    writeJson(path, { _cached_at: NOW - 120, data: 5 })
+    expect(
+      await sl.cachedFetch(
+        env,
+        options(path, async () => 9),
+      ),
+    ).toBe(9)
+  })
+
+  test('取得に失敗したら期限切れのキャッシュを返す', async () => {
+    const env = makeEnv()
+    const path = join(env.tmpDir(), 'c.json')
+    writeJson(path, { _cached_at: NOW - 120, data: 5 })
+    const failing = async (): Promise<number | null> => {
+      throw new Error('fail')
+    }
+    expect(await sl.cachedFetch(env, options(path, failing))).toBe(5)
+  })
+
+  test('取得に失敗しキャッシュも無ければ null', async () => {
+    const env = makeEnv()
+    const failing = async (): Promise<number | null> => {
+      throw new Error('fail')
+    }
+    expect(await sl.cachedFetch(env, options(join(env.tmpDir(), 'c.json'), failing))).toBeNull()
+  })
+
+  test('取得が null を返したら期限切れのキャッシュを返す', async () => {
+    const env = makeEnv()
+    const path = join(env.tmpDir(), 'c.json')
+    writeJson(path, { _cached_at: NOW - 120, data: 5 })
+    expect(
+      await sl.cachedFetch(
+        env,
+        options(path, async () => null),
+      ),
+    ).toBe(5)
+  })
+
+  test('cacheKey が一致しなければ取得し直す', async () => {
+    const env = makeEnv()
+    const path = join(env.tmpDir(), 'c.json')
+    writeJson(path, { _cached_at: NOW, data: 5, k: 'old' })
+    expect(
+      await sl.cachedFetch(
+        env,
+        options(path, async () => 9, { k: 'new' }),
+      ),
+    ).toBe(9)
+    expect(readJson(path)).toEqual({ k: 'new', _cached_at: NOW, data: 9 })
+  })
+
+  test('cacheKey が一致すればキャッシュを返す', async () => {
+    const env = makeEnv()
+    const path = join(env.tmpDir(), 'c.json')
+    writeJson(path, { _cached_at: NOW, data: 5, k: 'same' })
+    const fetch = mock(async () => 9)
+    expect(await sl.cachedFetch(env, options(path, fetch, { k: 'same' }))).toBe(5)
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  test('検証に通らないキャッシュは無いものとして扱う', async () => {
+    const env = makeEnv()
+    const path = join(env.tmpDir(), 'c.json')
+    writeJson(path, { _cached_at: NOW, data: 'not a number' })
+    expect(
+      await sl.cachedFetch(
+        env,
+        options(path, async () => 9),
+      ),
+    ).toBe(9)
   })
 })
