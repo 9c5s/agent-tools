@@ -412,3 +412,20 @@ test('checkNotation は docstring と番号付きリストのラベル区切り�
 test('checkNotation は表のセルだけの em ダッシュを検知しない', () => {
   expect(checkNotation('| `filePath` | 対応 | — | 限定 |')).toEqual([])
 })
+
+test('checkVocabulary は漢字に続く回を熟語として検知しない', () => {
+  expect(checkVocabulary('機体が旋回する')).toEqual([])
+  expect(checkVocabulary('発言を撤回した')).toEqual([])
+  expect(checkVocabulary('何回したか数える')).toEqual([])
+})
+
+test('checkVocabulary は年月日時分秒の直前の数字を境界の違反にしない', () => {
+  expect(checkVocabulary('2000年1月1日に始める')).toEqual([])
+  expect(checkVocabulary('5秒後')).toEqual([])
+  expect(checkVocabulary('10分待つ')).toEqual([])
+})
+
+test('checkVocabulary は年月日時分秒以外の助数詞の直前の数字は境界の違反にする', () => {
+  expect(checkVocabulary('3回押す').join('')).toContain('境界')
+  expect(checkVocabulary('162バイト読む').join('')).toContain('境界')
+})
