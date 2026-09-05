@@ -1636,3 +1636,249 @@ describe('segDailyCost', () => {
     expect(await sl.segDailyCost(data, makeCtx({ currency: 'JPY', env }))).toContain('¥184')
   })
 })
+
+const FULL_STDIN_SAMPLE: sl.Input = {
+  cwd: '/fallback/cwd/directory',
+  session_id: 'abc123...',
+  transcript_path: '/path/to/transcript.jsonl',
+  model: { id: 'claude-opus-4-6', display_name: 'Opus' },
+  workspace: {
+    current_dir: '/current/working/myproject',
+    project_dir: '/original/project/directory',
+  },
+  version: '1.0.80',
+  output_style: { name: 'default' },
+  cost: {
+    total_cost_usd: 0.01234,
+    total_duration_ms: 45000,
+    total_api_duration_ms: 2300,
+    total_lines_added: 156,
+    total_lines_removed: 23,
+  },
+  context_window: {
+    total_input_tokens: 15234,
+    total_output_tokens: 4521,
+    context_window_size: 200000,
+    used_percentage: 8,
+    remaining_percentage: 92,
+    current_usage: {
+      input_tokens: 8500,
+      output_tokens: 1200,
+      cache_creation_input_tokens: 5000,
+      cache_read_input_tokens: 2000,
+    },
+  },
+  exceeds_200k_tokens: false,
+  vim: { mode: 'NORMAL' },
+  agent: { name: 'security-reviewer' },
+  worktree: {
+    name: 'my-feature',
+    path: '/path/to/.claude/worktrees/my-feature',
+    branch: 'worktree-my-feature',
+    original_cwd: '/path/to/project',
+    original_branch: 'main',
+  },
+  rate_limits: {
+    five_hour: { used_percentage: 42, resets_at: 1736949000 },
+    seven_day: { used_percentage: 66, resets_at: 1737331200 },
+  },
+}
+
+describe('parseSegments', () => {
+  test('カンマで同じ行、パイプで行を分ける', () => {
+    expect(sl.parseSegments('project').map((line) => line.length)).toEqual([1])
+    expect(sl.parseSegments('project,branch,model').map((line) => line.length)).toEqual([3])
+    expect(sl.parseSegments('project,branch|model,context').map((line) => line.length)).toEqual([
+      2, 2,
+    ])
+  })
+
+  test('不明な名前は飛ばし、すべて不明な行は除く', () => {
+    expect(sl.parseSegments('project,unknown_seg,branch').map((line) => line.length)).toEqual([2])
+    expect(sl.parseSegments('xxx,yyy|project').map((line) => line.length)).toEqual([1])
+    expect(sl.parseSegments('constructor')).toEqual([])
+  })
+
+  test('既定の構成は 3 行になる', () => {
+    expect(sl.parseSegments(sl.DEFAULT_SEGMENTS).map((line) => line.length)).toEqual([2, 4, 2])
+    expect(sl.parseSegments(sl.DEFAULT_SEGMENTS)[0]).toEqual([sl.segProject, sl.segBranch])
+  })
+
+  test('前後の空白を除き、空文字は空の配列にする', () => {
+    expect(sl.parseSegments(' project , branch | model ').map((line) => line.length)).toEqual([
+      2, 1,
+    ])
+    expect(sl.parseSegments('')).toEqual([])
+    expect(sl.parseSegments('   ')).toEqual([])
+  })
+})
+
+describe('renderLine', () => {
+  test('セパレータで結合する', () => {
+    expect(sl.renderLine(['a', 'b'])).toBe('a │ b')
+    expect(sl.renderLine(['a'])).toBe('a')
+    expect(sl.renderLine([])).toBe('')
+    expect(sl.renderLine(['a', 'b', 'c'])).toBe('a │ b │ c')
+  })
+})
+
+describe('buildLines', () => {
+  function gitCtx(branch: string, remote?: string): sl.Ctx {
+    const responses: Record<string, { exitCode: number; stdout: string }> = {
+      'rev-parse --abbrev-ref HEAD': { exitCode: 0, stdout: `${branch}\n` },
+    }
+    if (remote) responses['remote get-url origin'] = { exitCode: 0, stdout: `${remote}\n` }
+    return makeCtx({ env: makeEnv({ spawnSync: fakeGit(responses).spawnSync }) })
+  }
+
+  test('すべてのデータがあれば 3 行になる', async () => {
+    const data: sl.Input = {
+      cwd: '/home/user/project',
+      model: { display_name: 'Opus', id: 'claude-opus-4-6' },
+      context_window: { used_percentage: 45 },
+      rate_limits: {
+        five_hour: { used_percentage: 30, resets_at: 1736949000 },
+        seven_day: { used_percentage: 50, resets_at: 1737331200 },
+      },
+      cost: { total_cost_usd: 1.23 },
+    }
+    const lines = await sl.buildLines(data, gitCtx('main', 'https://github.com/user/project.git'))
+    expect(lines).toHaveLength(3)
+    expect(lines[0]).toContain('project')
+    expect(lines[0]).toContain('main')
+    expect(lines[1]).toContain(sl.formatResetTimeShort(1736949000) ?? '')
+    expect(lines[1]).toContain(sl.formatResetDate(1737331200) ?? '')
+    expect(lines[2]).toContain('$1.23 (session)')
+  })
+
+  test('最小のデータでもプロジェクト行は返る', async () => {
+    const lines = await sl.buildLines({ cwd: '/home/user/project' }, makeCtx())
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain('project')
+    expect(await sl.buildLines({}, makeCtx())).toEqual([
+      sl.colorize(`${sl.ICONS_EMOJI.folder} unknown`, sl.Color.blue),
+    ])
+  })
+
+  test('同じ行のセグメントはセパレータで結合する', async () => {
+    const lines = await sl.buildLines({ cwd: '/home/user/project' }, gitCtx('main'))
+    expect(lines[0]).toContain('│')
+  })
+
+  test('構成を渡せば指定したセグメントだけ出す', async () => {
+    const data = {
+      cwd: '/home/user/project',
+      model: { display_name: 'Opus', id: 'claude-opus-4-6' },
+    }
+    const lines = await sl.buildLines(data, gitCtx('main'), sl.parseSegments('model'))
+    expect(lines).toEqual([`${sl.ICONS_EMOJI.model} Opus 4.6`])
+  })
+
+  test('branch を外せば git を実行しない', async () => {
+    const git = fakeGit({})
+    const ctx = makeCtx({ env: makeEnv({ spawnSync: git.spawnSync }) })
+    await sl.buildLines({ cwd: '/p' }, ctx, sl.parseSegments('project'))
+    expect(git.calls).toEqual([])
+  })
+
+  test('実際の stdin の構造で 3 行を組み立てる', async () => {
+    const env = makeEnv()
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.sessionCost), { sessions: { 'abc123...': 0 } })
+    const lines = await sl.buildLines(FULL_STDIN_SAMPLE, makeCtx({ env }))
+    expect(lines).toHaveLength(3)
+    expect(lines[0]).toContain('myproject')
+    expect(lines[1]).toContain('Opus 4.6')
+    expect(lines[1]).toContain(sl.formatResetTimeShort(1736949000) ?? '')
+    expect(lines[1]).toContain(sl.formatResetDate(1737331200) ?? '')
+    expect(lines[2]).toContain('$0.01')
+  })
+})
+
+describe('parseArgs', () => {
+  test('既定値', () => {
+    expect(sl.parseArgs([])).toEqual({
+      icons: undefined,
+      currency: undefined,
+      segments: sl.DEFAULT_SEGMENTS,
+      refreshUsage: false,
+    })
+  })
+
+  test('各オプションを読む (--icons は任意の文字列、--currency は大文字にする)', () => {
+    expect(sl.parseArgs(['--icons', 'nerd']).icons).toBe('nerd')
+    expect(sl.parseArgs(['--icons=foo']).icons).toBe('foo')
+    expect(sl.parseArgs(['--currency', 'jpy']).currency).toBe('JPY')
+    expect(sl.parseArgs(['--currency=eur', '--icons', 'nerd'])).toMatchObject({
+      currency: 'EUR',
+      icons: 'nerd',
+    })
+    expect(sl.parseArgs(['--segments', 'project|model']).segments).toBe('project|model')
+    expect(sl.parseArgs(['--refresh-usage']).refreshUsage).toBe(true)
+  })
+
+  test('不明なオプションは例外にする', () => {
+    expect(() => sl.parseArgs(['--bogus'])).toThrow()
+  })
+})
+
+describe('main', () => {
+  const stdin = (text: string) => async () => text
+
+  test('JSON を読んでステータス行を返す', async () => {
+    const git = fakeGit({ 'rev-parse --abbrev-ref HEAD': { exitCode: 0, stdout: 'main\n' } })
+    const env = makeEnv({ spawnSync: git.spawnSync })
+    const lines = await sl.main([], stdin(JSON.stringify(FULL_STDIN_SAMPLE)), env)
+    expect(lines).toHaveLength(3)
+    expect(lines[0]).toContain('myproject')
+    expect(lines[0]).toContain('main')
+  })
+
+  test('--icons nerd で Nerd Fonts のアイコンを使う', async () => {
+    const lines = await sl.main(
+      ['--icons', 'nerd'],
+      stdin(JSON.stringify(FULL_STDIN_SAMPLE)),
+      makeEnv(),
+    )
+    expect(lines[0]).toContain(sl.ICONS_NERD.folder)
+  })
+
+  test('--currency を通貨の決定に使う', async () => {
+    const env = makeEnv()
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.exchange), {
+      _cached_at: NOW,
+      data: 150,
+      currency: 'JPY',
+      date: sl.today(env),
+    })
+    const data = { cost: { total_cost_usd: 1.23 } }
+    const lines = await sl.main(
+      ['--currency', 'jpy', '--segments', 'session_cost'],
+      stdin(JSON.stringify(data)),
+      env,
+    )
+    expect(lines).toEqual([`${sl.ICONS_EMOJI.money} ¥184 (session)`])
+  })
+
+  test('空、JSON でない、オブジェクトでない stdin では何も返さない', async () => {
+    expect(await sl.main([], stdin(''), makeEnv())).toEqual([])
+    expect(await sl.main([], stdin('   \n'), makeEnv())).toEqual([])
+    expect(await sl.main([], stdin('{invalid'), makeEnv())).toEqual([])
+    expect(await sl.main([], stdin('[1, 2, 3]'), makeEnv())).toEqual([])
+  })
+
+  test('stdin の読み取りに失敗しても何も返さない', async () => {
+    const failing = async (): Promise<string> => {
+      throw new Error('EIO')
+    }
+    expect(await sl.main([], failing, makeEnv())).toEqual([])
+  })
+
+  test('--refresh-usage は stdin を読まずキャッシュを更新する', async () => {
+    const readStdin = mock(async () => '')
+    const env = makeEnv({ fetch: async () => jsonResponse(USAGE_API_SAMPLE) })
+    writeCredentials(env)
+    expect(await sl.main(['--refresh-usage'], readStdin, env)).toEqual([])
+    expect(readStdin).not.toHaveBeenCalled()
+    expect(readJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage))._cached_at).toBe(NOW)
+  })
+})
