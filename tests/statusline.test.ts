@@ -628,3 +628,104 @@ describe('formatCost', () => {
     expect(await sl.formatCost(1.23, ctxWithRate('XYZ', 1.5))).toBe('$1.23')
   })
 })
+
+// git のサブコマンド ("rev-parse --abbrev-ref HEAD" など) ごとの結果を返す偽の spawnSync
+function fakeGit(responses: Record<string, { exitCode: number; stdout: string }>) {
+  const calls: string[][] = []
+  const spawnSync: sl.Env['spawnSync'] = (cmd) => {
+    calls.push(cmd)
+    return responses[cmd.slice(1).join(' ')] ?? { exitCode: 128, stdout: '' }
+  }
+  return { calls, spawnSync }
+}
+
+describe('fetchGitInfo', () => {
+  test('ブランチ名とリモート URL を返す', () => {
+    const git = fakeGit({
+      'rev-parse --abbrev-ref HEAD': { exitCode: 0, stdout: 'main\n' },
+      'remote get-url origin': { exitCode: 0, stdout: 'https://github.com/user/repo.git\n' },
+    })
+    const env = makeEnv({ spawnSync: git.spawnSync })
+    expect(sl.fetchGitInfo('/some/path', env)).toEqual({
+      branch: 'main',
+      remote_url: 'https://github.com/user/repo.git',
+    })
+    expect(git.calls[0]).toEqual(['git', 'rev-parse', '--abbrev-ref', 'HEAD'])
+  })
+
+  test('detached HEAD では短縮ハッシュを使う', () => {
+    const git = fakeGit({
+      'rev-parse --abbrev-ref HEAD': { exitCode: 0, stdout: 'HEAD\n' },
+      'rev-parse --short HEAD': { exitCode: 0, stdout: 'abc1234\n' },
+    })
+    expect(sl.fetchGitInfo('/some/path', makeEnv({ spawnSync: git.spawnSync }))).toEqual({
+      branch: 'abc1234',
+    })
+  })
+
+  test('ブランチが取れなければ例外を投げる', () => {
+    const git = fakeGit({})
+    expect(() => sl.fetchGitInfo('/some/path', makeEnv({ spawnSync: git.spawnSync }))).toThrow(
+      'git branch not detected',
+    )
+  })
+
+  test('リモートが無ければ remote_url を持たない', () => {
+    const git = fakeGit({ 'rev-parse --abbrev-ref HEAD': { exitCode: 0, stdout: 'feature\n' } })
+    const info = sl.fetchGitInfo('/some/path', makeEnv({ spawnSync: git.spawnSync }))
+    expect(info).toEqual({ branch: 'feature' })
+    expect('remote_url' in info).toBe(false)
+  })
+
+  test('cwd が空なら spawnSync に undefined を渡す', () => {
+    const cwds: (string | undefined)[] = []
+    const env = makeEnv({
+      spawnSync: (_cmd, cwd) => {
+        cwds.push(cwd)
+        return { exitCode: 0, stdout: 'main\n' }
+      },
+    })
+    sl.fetchGitInfo('', env)
+    expect(cwds[0]).toBeUndefined()
+  })
+})
+
+describe('getGitInfo', () => {
+  test('取得した情報を cwd をキーに保存して返す', async () => {
+    const git = fakeGit({ 'rev-parse --abbrev-ref HEAD': { exitCode: 0, stdout: 'main\n' } })
+    const env = makeEnv({ spawnSync: git.spawnSync })
+    expect(await sl.getGitInfo('/some/path', env)).toEqual({ branch: 'main' })
+    expect(readJson(sl.cachePath(env, sl.CACHE_FILES.git))).toEqual({
+      cwd: '/some/path',
+      _cached_at: NOW,
+      data: { branch: 'main' },
+    })
+  })
+
+  test('有効なキャッシュがあれば git を実行しない', async () => {
+    const git = fakeGit({})
+    const env = makeEnv({ spawnSync: git.spawnSync })
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.git), {
+      _cached_at: NOW,
+      data: { branch: 'cached-branch' },
+      cwd: '/some/path',
+    })
+    expect(await sl.getGitInfo('/some/path', env)).toEqual({ branch: 'cached-branch' })
+    expect(git.calls).toEqual([])
+  })
+
+  test('cwd が違えばキャッシュを無効にして取り直す', async () => {
+    const git = fakeGit({ 'rev-parse --abbrev-ref HEAD': { exitCode: 0, stdout: 'new-branch\n' } })
+    const env = makeEnv({ spawnSync: git.spawnSync })
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.git), {
+      _cached_at: NOW,
+      data: { branch: 'old-branch' },
+      cwd: '/old/path',
+    })
+    expect(await sl.getGitInfo('/new/path', env)).toEqual({ branch: 'new-branch' })
+  })
+
+  test('git が無くキャッシュも無ければ null', async () => {
+    expect(await sl.getGitInfo('/some/path', makeEnv())).toBeNull()
+  })
+})
