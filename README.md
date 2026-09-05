@@ -41,7 +41,7 @@ agent-tools/
 │   ├── hooks/
 │   ├── scripts/
 │   └── settings.json
-├── tests/                            # hook のテスト
+├── tests/                            # hook とスクリプトのテスト
 ├── biome.json                        # lint とフォーマットの設定
 ├── tsconfig.json                     # 型チェックの設定
 ├── package.json
