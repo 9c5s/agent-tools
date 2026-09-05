@@ -14,6 +14,7 @@ import {
 } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
+import { parseArgs as parseNodeArgs } from 'node:util'
 
 // stdin の JSON はこの型で受け取り、各セグメントが必要なフィールドの型を検査する
 export type Input = Record<string, unknown>
@@ -911,4 +912,132 @@ export async function segDailyCost(data: Input, ctx: Ctx): Promise<string | null
   const daily = getDailyCost(data, ctx.env)
   if (daily === null || daily <= 0) return null
   return `${ctx.icons.money} ${await formatCost(daily, ctx)} (daily)`
+}
+
+const SEPARATOR = ' │ '
+
+export type SegmentFn = (data: Input, ctx: Ctx) => string | null | Promise<string | null>
+
+export const SEGMENT_REGISTRY: Record<string, SegmentFn> = {
+  project: segProject,
+  branch: segBranch,
+  model: segModel,
+  context: segContext,
+  lines: segLines,
+  rate_5h: segRate5h,
+  rate_7d: segRate7d,
+  session_cost: segSessionCost,
+  daily_cost: segDailyCost,
+}
+
+export const DEFAULT_SEGMENTS =
+  'project,branch|model,context,rate_5h,rate_7d|session_cost,daily_cost'
+
+// "a,b|c" のような構成文字列を行ごとのセグメント関数の配列にする (不明な名前は飛ばす)
+export function parseSegments(spec: string): SegmentFn[][] {
+  if (!spec.trim()) return []
+  const lines: SegmentFn[][] = []
+  for (const line of spec.split('|')) {
+    const fns: SegmentFn[] = []
+    for (const rawName of line.split(',')) {
+      const name = rawName.trim()
+      const fn = Object.hasOwn(SEGMENT_REGISTRY, name) ? SEGMENT_REGISTRY[name] : undefined
+      if (fn) fns.push(fn)
+    }
+    if (fns.length > 0) lines.push(fns)
+  }
+  return lines
+}
+
+export function renderLine(segments: string[]): string {
+  return segments.join(SEPARATOR)
+}
+
+// 行ごとにセグメントを順に評価し、空でない行だけを返す
+export async function buildLines(
+  data: Input,
+  ctx: Ctx,
+  lines: SegmentFn[][] = parseSegments(DEFAULT_SEGMENTS),
+): Promise<string[]> {
+  const output: string[] = []
+  for (const fns of lines) {
+    const segments: string[] = []
+    for (const fn of fns) {
+      const text = await fn(data, ctx)
+      if (text !== null) segments.push(text)
+    }
+    if (segments.length > 0) output.push(renderLine(segments))
+  }
+  return output
+}
+
+export type Args = {
+  icons: string | undefined
+  currency: string | undefined
+  segments: string
+  refreshUsage: boolean
+}
+
+// 不明なオプションは例外にする (入口が stderr に出して終了コード 2 で終わる)
+export function parseArgs(argv: string[]): Args {
+  const { values } = parseNodeArgs({
+    args: argv,
+    strict: true,
+    options: {
+      icons: { type: 'string' },
+      currency: { type: 'string' },
+      segments: { type: 'string', default: DEFAULT_SEGMENTS },
+      'refresh-usage': { type: 'boolean', default: false },
+    },
+  })
+  return {
+    icons: values.icons,
+    currency: values.currency?.toUpperCase(),
+    segments: values.segments ?? DEFAULT_SEGMENTS,
+    refreshUsage: values['refresh-usage'] ?? false,
+  }
+}
+
+// stdin の JSON からステータス行を組み立てる。表示しない条件では空の配列を返す
+// --refresh-usage では stdin を読まず、使用量キャッシュの更新だけを行う
+export async function main(
+  argv: string[],
+  readStdin: () => Promise<string>,
+  env: Env,
+): Promise<string[]> {
+  const args = parseArgs(argv)
+  if (args.refreshUsage) {
+    await refreshModelUsage(env)
+    return []
+  }
+  const ctx: Ctx = {
+    icons: args.icons === 'nerd' ? ICONS_NERD : ICONS_EMOJI,
+    currency: resolveCurrency(args.currency, env),
+    env,
+  }
+  let raw: string
+  try {
+    raw = await readStdin()
+  } catch {
+    return []
+  }
+  if (!raw.trim()) return []
+  let data: unknown
+  try {
+    data = JSON.parse(raw)
+  } catch {
+    return []
+  }
+  if (!isRecord(data)) return []
+  return buildLines(data, ctx, parseSegments(args.segments))
+}
+
+if (import.meta.main) {
+  try {
+    const lines = await main(process.argv.slice(2), () => Bun.stdin.text(), defaultEnv)
+    if (lines.length > 0) process.stdout.write(`${lines.join('\n')}\n`)
+  } catch (error) {
+    process.stderr.write(`statusline: ${errorMessage(error)}\n`)
+    process.exit(2)
+  }
 }
