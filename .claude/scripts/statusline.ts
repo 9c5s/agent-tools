@@ -244,7 +244,7 @@ export function today(env: Env): string {
 
 export type CacheObject = Record<string, unknown>
 
-// キャッシュファイルを読む (無い、壊れている場合は空のオブジェクト)
+// キャッシュファイルを読む (無い、解析できない場合は空のオブジェクト)
 export function readCacheObject(path: string): CacheObject {
   try {
     const obj: unknown = JSON.parse(readFileSync(path, 'utf8'))
@@ -512,5 +512,69 @@ export function getGitInfo(cwd: string, env: Env): Promise<GitInfo | null> {
     cacheKey: { cwd },
     isValid: isGitInfo,
     fetch: async () => fetchGitInfo(cwd, env),
+  })
+}
+
+// cost.total_cost_usd を数値で取る (無い、数値でない場合は null)
+function totalCostUsd(data: Input): number | null {
+  const cost = data.cost
+  if (!isRecord(cost) || cost.total_cost_usd === undefined || cost.total_cost_usd === null) {
+    return null
+  }
+  return safeFloat(cost.total_cost_usd)
+}
+
+// キャッシュの sessions を数値の辞書として読む (数値でない値は捨てる)
+function readSessions(value: unknown): Record<string, number> {
+  if (!isRecord(value)) return {}
+  const sessions: Record<string, number> = {}
+  for (const [id, total] of Object.entries(value)) {
+    const n = safeFloat(total)
+    if (n !== null) sessions[id] = n
+  }
+  return sessions
+}
+
+// セッション開始時の合計を基準値として記録し、そこからの差分を返す
+// (Claude Code の再起動で session_id が変わらずコストが引き継がれる場合に備える)
+export function getSessionCost(data: Input, env: Env): number | null {
+  const total = totalCostUsd(data)
+  if (total === null) return null
+  const sessionId = data.session_id
+  if (typeof sessionId !== 'string' || sessionId === '') return total
+  const path = cachePath(env, CACHE_FILES.sessionCost)
+  return withFileLock(path, () => {
+    const sessions = readSessions(readCacheObject(path).sessions)
+    const baseline = sessions[sessionId]
+    if (baseline !== undefined) return total - baseline
+    sessions[sessionId] = total
+    writeCache(path, { sessions })
+    return 0
+  })
+}
+
+// セッションごとの前回値との増分を日次で累積する (日付が変わればすべてリセットする)
+// 新しいセッションは前回値の記録だけ行い、日をまたいだセッションの前日分を含めない
+export function getDailyCost(data: Input, env: Env): number | null {
+  const total = totalCostUsd(data)
+  if (total === null) return null
+  const sessionId = typeof data.session_id === 'string' ? data.session_id : ''
+  const date = today(env)
+  const path = cachePath(env, CACHE_FILES.dailyCost)
+  return withFileLock(path, () => {
+    const cache = readCacheObject(path)
+    let accumulated = 0
+    let sessions: Record<string, number> = {}
+    if (cache.date === date) {
+      accumulated = safeFloat(cache.accumulated) ?? 0
+      sessions = readSessions(cache.sessions)
+    }
+    const last = sessions[sessionId]
+    if (last !== undefined && total - last > 0) accumulated += total - last
+    if (last !== total) {
+      sessions[sessionId] = total
+      writeCache(path, { date, sessions, accumulated })
+    }
+    return accumulated
   })
 }
