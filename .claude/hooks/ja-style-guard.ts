@@ -32,12 +32,13 @@ export function checkDescription(toolName: unknown, input: unknown): string | nu
 }
 
 // 日本語文の句読点に半角の , . が使われていないかを探す
-// 直後が英数字なら拡張子やバージョン番号とみなして見逃す
-const HALF_PUNCT_RE = /[\p{sc=Hiragana}\p{sc=Katakana}\p{sc=Han}][,.](?![0-9A-Za-z])/gu
+// 直後が英数字なら拡張子やバージョン番号 ドットの連続なら省略記号とみなして見逃す
+const HALF_PUNCT_RE = /[\p{sc=Hiragana}\p{sc=Katakana}\p{sc=Han}][,.](?![0-9A-Za-z.])/gu
 
 // 日本語と英数字が半角スペースなしで隣接している箇所を探す
+// 直前が \ ならエスケープシーケンス (\n など) の一部とみなして見逃す
 const JA_ASCII_RE =
-  /[\p{sc=Hiragana}\p{sc=Katakana}\p{sc=Han}][0-9A-Za-z]|[0-9A-Za-z][\p{sc=Hiragana}\p{sc=Katakana}\p{sc=Han}]/gu
+  /[\p{sc=Hiragana}\p{sc=Katakana}\p{sc=Han}][0-9A-Za-z]|(?<!\\)[0-9A-Za-z][\p{sc=Hiragana}\p{sc=Katakana}\p{sc=Han}]/gu
 
 // 日本語の地の文で使わないダッシュ類 (em ダッシュと horizontal bar)
 const DASH_RE = /[—―]/gu
@@ -57,14 +58,21 @@ function stripCodeBlocks(text: string): string {
     .join('\n')
 }
 
-// 箇条書きのラベルと説明を区切る em ダッシュを取り除く
-// 索引や項目の一覧で広く使われている書式で 地の文のダッシュとは役割が違う
-// 2 倍ダッシュと 箇条書き以外の行のダッシュは残して検知させる
+// 箇条書きとコメント見出しのラベルと説明を区切る em ダッシュを取り除く
+// 索引や項目の一覧 ファイル冒頭の見出しで広く使われている書式で 地の文のダッシュとは役割が違う
+// 2 倍ダッシュと それ以外の行のダッシュは残して検知させる
+const LABEL_LINE_RE = /^\s*(?:[-*]|\/\/|#+) /
+
 function stripListLabelDash(text: string): string {
   return text
     .split('\n')
-    .map((line) => (/^\s*[-*] /.test(line) ? line.replace(/(?<!—) — (?!—)/gu, ' ') : line))
+    .map((line) => (LABEL_LINE_RE.test(line) ? line.replace(/(?<!—) — (?!—)/gu, ' ') : line))
     .join('\n')
+}
+
+// 括弧の内側の半角カンマを空白にする (タプルや引数の列挙は日本語文の読点ではない)
+function stripParenCommas(text: string): string {
+  return text.replace(/[(（][^()（）]*[)）]/gu, (part) => part.replace(/,/gu, ' '))
 }
 
 // インラインコードを取り除く (識別子や書式例を地の文として検査しないため)
@@ -84,7 +92,7 @@ export function checkNotation(text: string): string[] {
   const found: string[] = []
   const lines = japaneseLines(text)
   const target = lines.join('\n')
-  const halfPunct = target.match(HALF_PUNCT_RE)
+  const halfPunct = stripParenCommas(target).match(HALF_PUNCT_RE)
   if (halfPunct) {
     found.push(`日本語文の句読点は 、 。 を使う (半角の , . は使わない): ${halfPunct.join(' ')}`)
   }
@@ -105,7 +113,7 @@ export function checkNotation(text: string): string[] {
 const VOCABULARY_RULES: { pattern: RegExp; hint: string }[] = [
   {
     pattern:
-      /落ち(る|た|て|ます)|(?<!見)落と(す|し|そう)(?!穴)|倒(す|れる|し)|潰(す|れる|し)|コケ(る|た)|クラッシュ|殺(す|し)|死ぬ|飛(ぶ|んで)|吹っ飛|弾(く|か|い)|叩(く|い)|回(す|して|した)|撃(つ|って)|流(す|して|れる)|詰まる|素通し|張り付|(?<![破崩損])壊(す|れる|れた)|崩(れる|れた)|効く|載(る|って)|食い違/gu,
+      /落ち(る|た|て|ます)|(?<!見)落と(す|し|そう)(?!穴)|倒(す|れる|し)|潰(す|れる|し)|コケ(る|た)|クラッシュ|殺(す|し)|死ぬ|飛(ぶ|んで)|吹っ飛|弾(く|か|い)|叩(く|い)|(?<![巡周])回(す|して|した)|撃(つ|って)|流(す|して|れる)|詰まる|素通し|張り付|(?<![破崩損])壊(す|れる|れた)|崩(れる|れた)|効く|載(る|って)|食い違/gu,
     hint: '擬人化と口語の動詞を使わない (除外される 異常終了する 無効化する のような正式な表現に直す)',
   },
   {
