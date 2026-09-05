@@ -863,3 +863,303 @@ describe('getDailyCost', () => {
     expect(sl.getDailyCost(dailyData(3, 'b'), env)).toBeCloseTo(8)
   })
 })
+
+const USAGE_API_SAMPLE = {
+  five_hour: { utilization: 28.0, resets_at: '2026-08-22T07:19:59+00:00' },
+  seven_day: { utilization: 51.0, resets_at: '2026-08-23T02:59:59+00:00' },
+  seven_day_opus: null,
+  limits: [
+    {
+      kind: 'session',
+      group: 'session',
+      percent: 28,
+      resets_at: '2026-08-22T07:19:59+00:00',
+      scope: null,
+    },
+    {
+      kind: 'weekly_all',
+      group: 'weekly',
+      percent: 51,
+      resets_at: '2026-08-23T02:59:59+00:00',
+      scope: null,
+    },
+    {
+      kind: 'weekly_scoped',
+      group: 'weekly',
+      percent: 87,
+      resets_at: '2026-08-23T02:59:59+00:00',
+      scope: { model: { id: null, display_name: 'Fable' }, surface: null },
+    },
+  ],
+}
+
+const WEEKLY_RESETS_AT = Date.UTC(2026, 7, 23, 2, 59, 59) / 1000
+
+function writeCredentials(
+  env: sl.Env,
+  options: { token?: string; expiresInMs?: number } = {},
+): void {
+  mkdirSync(join(env.homeDir(), '.claude'), { recursive: true })
+  writeJson(join(env.homeDir(), '.claude', '.credentials.json'), {
+    claudeAiOauth: {
+      accessToken: options.token ?? 'tok-abc',
+      expiresAt: env.now() * 1000 + (options.expiresInMs ?? 3_600_000),
+      subscriptionType: 'max',
+    },
+  })
+}
+
+const ENTRY: sl.ModelUsageEntry = { display_name: 'Fable', percent: 87, resets_at: null }
+const WEEKLY: sl.RateBucket = { used_percentage: 51, resets_at: 1787454000 }
+
+describe('readAccessToken', () => {
+  test('期限内のトークンを返す', () => {
+    const env = makeEnv()
+    writeCredentials(env)
+    expect(sl.readAccessToken(env)).toBe('tok-abc')
+  })
+
+  test('期限切れなら null', () => {
+    const env = makeEnv()
+    writeCredentials(env, { expiresInMs: -1000 })
+    expect(sl.readAccessToken(env)).toBeNull()
+  })
+
+  test('ファイルが無い、JSON でない、oauth の節が無い場合は null', () => {
+    const env = makeEnv()
+    expect(sl.readAccessToken(env)).toBeNull()
+    mkdirSync(join(env.homeDir(), '.claude'), { recursive: true })
+    writeFileSync(join(env.homeDir(), '.claude', '.credentials.json'), '{broken', 'utf8')
+    expect(sl.readAccessToken(env)).toBeNull()
+    writeJson(join(env.homeDir(), '.claude', '.credentials.json'), { other: {} })
+    expect(sl.readAccessToken(env)).toBeNull()
+  })
+})
+
+describe('parseIsoTimestamp', () => {
+  test('ISO 8601 を epoch 秒にする', () => {
+    expect(sl.parseIsoTimestamp('2026-08-23T02:59:59+00:00')).toBe(WEEKLY_RESETS_AT)
+  })
+
+  test('文字列でない、解釈できない値は null', () => {
+    expect(sl.parseIsoTimestamp(null)).toBeNull()
+    expect(sl.parseIsoTimestamp(123)).toBeNull()
+    expect(sl.parseIsoTimestamp('not a date')).toBeNull()
+  })
+})
+
+describe('fetchUsageSnapshot', () => {
+  function envWithUsage(body: unknown, status = 200): sl.Env {
+    const env = makeEnv({ fetch: async () => jsonResponse(body, status) })
+    writeCredentials(env)
+    return env
+  }
+
+  test('weekly_all を週次バケットとして取り出す', async () => {
+    const snapshot = await sl.fetchUsageSnapshot(envWithUsage(USAGE_API_SAMPLE))
+    expect(snapshot?.weekly).toEqual({ used_percentage: 51, resets_at: WEEKLY_RESETS_AT })
+  })
+
+  test('weekly_all が無い、リセット時刻が無い場合は weekly が null', async () => {
+    const withoutWeekly = { limits: [USAGE_API_SAMPLE.limits[2]] }
+    expect((await sl.fetchUsageSnapshot(envWithUsage(withoutWeekly)))?.weekly).toBeNull()
+    const withoutReset = { limits: [{ kind: 'weekly_all', percent: 51, resets_at: null }] }
+    expect((await sl.fetchUsageSnapshot(envWithUsage(withoutReset)))?.weekly).toBeNull()
+  })
+
+  test('weekly_scoped をモデル別のエントリに射影する', async () => {
+    const snapshot = await sl.fetchUsageSnapshot(envWithUsage(USAGE_API_SAMPLE))
+    expect(snapshot?.model_scoped).toEqual([
+      { display_name: 'Fable', percent: 87, resets_at: WEEKLY_RESETS_AT },
+    ])
+  })
+
+  test('モデルの scope が無い weekly_scoped は除く', async () => {
+    const body = { limits: [{ kind: 'weekly_scoped', percent: 10, resets_at: null, scope: null }] }
+    expect((await sl.fetchUsageSnapshot(envWithUsage(body)))?.model_scoped).toEqual([])
+  })
+
+  test('resets_at が null のエントリは残す', async () => {
+    const body = {
+      limits: [
+        {
+          kind: 'weekly_scoped',
+          percent: 10,
+          resets_at: null,
+          scope: { model: { display_name: 'Sonnet' } },
+        },
+      ],
+    }
+    expect((await sl.fetchUsageSnapshot(envWithUsage(body)))?.model_scoped).toEqual([
+      { display_name: 'Sonnet', percent: 10, resets_at: null },
+    ])
+  })
+
+  test('limits が無ければ空のスナップショット', async () => {
+    expect(await sl.fetchUsageSnapshot(envWithUsage({}))).toEqual({
+      weekly: null,
+      model_scoped: [],
+    })
+  })
+
+  test('トークンが無ければ null で fetch を呼ばない', async () => {
+    const fetch = mock(async (_input: string | URL | Request) => jsonResponse(USAGE_API_SAMPLE))
+    expect(await sl.fetchUsageSnapshot(makeEnv({ fetch }))).toBeNull()
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  test('HTTP エラーや通信の失敗は null', async () => {
+    expect(await sl.fetchUsageSnapshot(envWithUsage({}, 500))).toBeNull()
+    const env = makeEnv()
+    writeCredentials(env)
+    expect(await sl.fetchUsageSnapshot(env)).toBeNull()
+  })
+
+  test('Authorization ヘッダにトークンを付ける', async () => {
+    const fetch = mock(async (_input: string | URL | Request, _init?: RequestInit) =>
+      jsonResponse(USAGE_API_SAMPLE),
+    )
+    const env = makeEnv({ fetch })
+    writeCredentials(env, { token: 'tok-xyz' })
+    await sl.fetchUsageSnapshot(env)
+    const headers = fetch.mock.calls[0]?.[1]?.headers as Record<string, string> | undefined
+    expect(headers?.Authorization).toBe('Bearer tok-xyz')
+  })
+})
+
+describe('refreshSpawnOptions', () => {
+  test('Windows ではコンソール窓を隠すだけでデタッチしない', () => {
+    expect(sl.refreshSpawnOptions('win32')).toEqual({ windowsHide: true })
+  })
+
+  test('それ以外では新しいセッションで起動する', () => {
+    expect(sl.refreshSpawnOptions('linux')).toEqual({ detached: true })
+    expect(sl.refreshSpawnOptions('darwin')).toEqual({ detached: true })
+  })
+})
+
+describe('spawnUsageRefresh', () => {
+  test('自分自身を --refresh-usage で起動する', () => {
+    const spawn = mock((_cmd: string[], _options: sl.RefreshSpawnOptions) => undefined)
+    sl.spawnUsageRefresh(makeEnv({ spawn }))
+    const cmd = spawn.mock.calls[0]?.[0] ?? []
+    expect(cmd[0]).toBe(process.execPath)
+    expect(cmd[1]?.endsWith('statusline.ts')).toBe(true)
+    expect(cmd[2]).toBe('--refresh-usage')
+    expect(spawn.mock.calls[0]?.[1]).toEqual(sl.refreshSpawnOptions(process.platform))
+  })
+
+  test('起動に失敗しても例外を外に出さない', () => {
+    const env = makeEnv({
+      spawn: () => {
+        throw new Error('spawn failed')
+      },
+    })
+    expect(() => sl.spawnUsageRefresh(env)).not.toThrow()
+  })
+})
+
+describe('getModelUsage', () => {
+  function writeUsageCache(env: sl.Env, cachedAt: number, attemptedAt: number): void {
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage), {
+      _cached_at: cachedAt,
+      _attempted_at: attemptedAt,
+      data: [ENTRY],
+      weekly: WEEKLY,
+    })
+  }
+
+  test('TTL 内はキャッシュを返し更新を起動しない', () => {
+    const spawn = mock(() => undefined)
+    const env = makeEnv({ spawn })
+    writeUsageCache(env, NOW, NOW)
+    expect(sl.getModelUsage(env)).toEqual({ entries: [ENTRY], weekly: WEEKLY })
+    expect(spawn).not.toHaveBeenCalled()
+  })
+
+  test('TTL 切れでは期限切れの値を返しつつ更新を起動する', () => {
+    const spawn = mock(() => undefined)
+    const env = makeEnv({ spawn })
+    writeUsageCache(env, NOW - 600, NOW - 600)
+    expect(sl.getModelUsage(env)).toEqual({ entries: [ENTRY], weekly: WEEKLY })
+    expect(spawn).toHaveBeenCalledTimes(1)
+  })
+
+  test('STALE を超えて更新できていない値は返さない', () => {
+    const env = makeEnv()
+    writeUsageCache(env, NOW - 10_000, NOW)
+    expect(sl.getModelUsage(env)).toEqual({ entries: null, weekly: null })
+  })
+
+  test('起動前に試行時刻を記録し、直後の呼び出しでは重複起動しない', () => {
+    const spawn = mock(() => undefined)
+    const env = makeEnv({ spawn })
+    writeUsageCache(env, NOW - 600, NOW - 600)
+    sl.getModelUsage(env)
+    sl.getModelUsage(env)
+    expect(spawn).toHaveBeenCalledTimes(1)
+    expect(readJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage))._attempted_at).toBe(NOW)
+  })
+
+  test('直近に試行済みなら再試行を起動しない', () => {
+    const spawn = mock(() => undefined)
+    const env = makeEnv({ spawn })
+    writeUsageCache(env, NOW - 10_000, NOW)
+    sl.getModelUsage(env)
+    expect(spawn).not.toHaveBeenCalled()
+  })
+
+  test('キャッシュが無ければ null を返して更新を起動する', () => {
+    const spawn = mock(() => undefined)
+    expect(sl.getModelUsage(makeEnv({ spawn }))).toEqual({ entries: null, weekly: null })
+    expect(spawn).toHaveBeenCalledTimes(1)
+  })
+
+  test('表示の経路では HTTP を発行しない', () => {
+    const fetch = mock(async (_input: string | URL | Request) => jsonResponse(USAGE_API_SAMPLE))
+    sl.getModelUsage(makeEnv({ fetch }))
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  test('形の合わない weekly は null にする', () => {
+    const env = makeEnv()
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage), {
+      _cached_at: NOW,
+      _attempted_at: NOW,
+      data: [ENTRY],
+      weekly: { used_percentage: 'x' },
+    })
+    expect(sl.getModelUsage(env).weekly).toBeNull()
+  })
+})
+
+describe('refreshModelUsage', () => {
+  test('取得に成功したら週次値とモデル別枠と時刻を書く', async () => {
+    const env = makeEnv({ fetch: async () => jsonResponse(USAGE_API_SAMPLE) })
+    writeCredentials(env)
+    await sl.refreshModelUsage(env)
+    const cache = readJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage))
+    expect(cache.data).toEqual([
+      { display_name: 'Fable', percent: 87, resets_at: WEEKLY_RESETS_AT },
+    ])
+    expect(cache.weekly).toEqual({ used_percentage: 51, resets_at: WEEKLY_RESETS_AT })
+    expect(cache._cached_at).toBe(NOW)
+    expect(cache._attempted_at).toBe(NOW)
+  })
+
+  test('取得に失敗したら既存の値を保ち試行時刻だけ更新する', async () => {
+    const env = makeEnv()
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage), {
+      _cached_at: 100,
+      _attempted_at: 100,
+      data: [ENTRY],
+      weekly: WEEKLY,
+    })
+    await sl.refreshModelUsage(env)
+    const cache = readJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage))
+    expect(cache.data).toEqual([ENTRY])
+    expect(cache.weekly).toEqual(WEEKLY)
+    expect(cache._cached_at).toBe(100)
+    expect(cache._attempted_at).toBe(NOW)
+  })
+})
