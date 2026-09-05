@@ -159,7 +159,7 @@ describe('osc8Link', () => {
     )
   })
 
-  test('空のテキストでも壊れない', () => {
+  test('空のテキストでも同じ形式になる', () => {
     expect(sl.osc8Link('https://example.com', '')).toBe(
       '\x1b]8;;https://example.com\x07\x1b]8;;\x07',
     )
@@ -267,7 +267,7 @@ describe('readCacheObject', () => {
     expect(sl.readCacheObject(path)).toEqual({ a: 1 })
   })
 
-  test('無い、壊れている、オブジェクトでない場合は空のオブジェクト', () => {
+  test('無い、解析できない、オブジェクトでない場合は空のオブジェクト', () => {
     const dir = makeDir()
     expect(sl.readCacheObject(join(dir, 'absent.json'))).toEqual({})
     writeFileSync(join(dir, 'broken.json'), '{oops', 'utf8')
@@ -727,5 +727,139 @@ describe('getGitInfo', () => {
 
   test('git が無くキャッシュも無ければ null', async () => {
     expect(await sl.getGitInfo('/some/path', makeEnv())).toBeNull()
+  })
+})
+
+describe('getSessionCost', () => {
+  const costData = (total: number | string, sessionId?: string): sl.Input => ({
+    cost: { total_cost_usd: total },
+    ...(sessionId === undefined ? {} : { session_id: sessionId }),
+  })
+
+  test('cost が無い、total_cost_usd が無い、数値でない場合は null', () => {
+    const env = makeEnv()
+    expect(sl.getSessionCost({}, env)).toBeNull()
+    expect(sl.getSessionCost({ cost: {} }, env)).toBeNull()
+    expect(sl.getSessionCost({ cost: 'x' }, env)).toBeNull()
+    expect(sl.getSessionCost(costData('abc'), env)).toBeNull()
+  })
+
+  test('session_id が無ければ合計をそのまま返す', () => {
+    expect(sl.getSessionCost(costData(1.5), makeEnv())).toBe(1.5)
+  })
+
+  test('新しいセッションは基準値を記録して 0 を返す', () => {
+    const env = makeEnv()
+    expect(sl.getSessionCost(costData(2.5, 's1'), env)).toBe(0)
+    expect(readJson(sl.cachePath(env, sl.CACHE_FILES.sessionCost))).toEqual({
+      sessions: { s1: 2.5 },
+    })
+  })
+
+  test('既知のセッションは基準値との差分を返す', () => {
+    const env = makeEnv()
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.sessionCost), { sessions: { s1: 2.5 } })
+    expect(sl.getSessionCost(costData(4, 's1'), env)).toBeCloseTo(1.5)
+  })
+
+  test('別のセッションの基準値を保つ', () => {
+    const env = makeEnv()
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.sessionCost), { sessions: { s1: 2.5 } })
+    sl.getSessionCost(costData(1, 's2'), env)
+    expect(readJson(sl.cachePath(env, sl.CACHE_FILES.sessionCost))).toEqual({
+      sessions: { s1: 2.5, s2: 1 },
+    })
+  })
+
+  test('解析できないキャッシュは空として扱う', () => {
+    const env = makeEnv()
+    writeFileSync(sl.cachePath(env, sl.CACHE_FILES.sessionCost), '{broken', 'utf8')
+    expect(sl.getSessionCost(costData(3, 's1'), env)).toBe(0)
+  })
+})
+
+describe('getDailyCost', () => {
+  const dailyData = (total: number | string, sessionId = 'sess-a'): sl.Input => ({
+    cost: { total_cost_usd: total },
+    session_id: sessionId,
+  })
+
+  test('初回はセッションを記録して 0 を返す', () => {
+    const env = makeEnv()
+    expect(sl.getDailyCost(dailyData(0), env)).toBe(0)
+    expect(readJson(sl.cachePath(env, sl.CACHE_FILES.dailyCost))).toEqual({
+      date: sl.today(env),
+      sessions: { 'sess-a': 0 },
+      accumulated: 0,
+    })
+  })
+
+  test('同じセッションの増分を累積する', () => {
+    const env = makeEnv()
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.dailyCost), {
+      date: sl.today(env),
+      sessions: { 'sess-a': 2 },
+      accumulated: 3,
+    })
+    expect(sl.getDailyCost(dailyData(5), env)).toBeCloseTo(6)
+  })
+
+  test('新しいセッションは記録だけして累積しない', () => {
+    const env = makeEnv()
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.dailyCost), {
+      date: sl.today(env),
+      sessions: { 'sess-a': 10 },
+      accumulated: 15,
+    })
+    expect(sl.getDailyCost(dailyData(0.5, 'sess-b'), env)).toBeCloseTo(15)
+    const cache = readJson(sl.cachePath(env, sl.CACHE_FILES.dailyCost))
+    expect(cache.sessions).toEqual({ 'sess-a': 10, 'sess-b': 0.5 })
+  })
+
+  test('日付が変わるとセッションの追跡と累積をリセットする', () => {
+    const env = makeEnv()
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.dailyCost), {
+      date: '1999-01-01',
+      sessions: { 'old-sess': 50 },
+      accumulated: 100,
+    })
+    expect(sl.getDailyCost(dailyData(2), env)).toBe(0)
+    const cache = readJson(sl.cachePath(env, sl.CACHE_FILES.dailyCost))
+    expect(cache.date).toBe(sl.today(env))
+    expect(cache.sessions).toEqual({ 'sess-a': 2 })
+  })
+
+  test('cost が無い、total_cost_usd が無い、数値でない場合は null', () => {
+    const env = makeEnv()
+    expect(sl.getDailyCost({}, env)).toBeNull()
+    expect(sl.getDailyCost({ cost: {} }, env)).toBeNull()
+    expect(sl.getDailyCost(dailyData('abc'), env)).toBeNull()
+  })
+
+  test('解析できないキャッシュは空として扱う', () => {
+    const env = makeEnv()
+    writeFileSync(sl.cachePath(env, sl.CACHE_FILES.dailyCost), '{broken', 'utf8')
+    expect(sl.getDailyCost(dailyData(1), env)).toBe(0)
+  })
+
+  test('1 日に複数のセッションのコストを累積する', () => {
+    const env = makeEnv()
+    expect(sl.getDailyCost(dailyData(0, 's1'), env)).toBe(0)
+    expect(sl.getDailyCost(dailyData(3, 's1'), env)).toBeCloseTo(3)
+    expect(sl.getDailyCost(dailyData(5, 's1'), env)).toBeCloseTo(5)
+    expect(sl.getDailyCost(dailyData(0, 's2'), env)).toBeCloseTo(5)
+    expect(sl.getDailyCost(dailyData(2, 's2'), env)).toBeCloseTo(7)
+  })
+
+  test('複数のセッションが交互に呼んでも値が行き来しない', () => {
+    const env = makeEnv()
+    sl.getDailyCost(dailyData(0, 'a'), env)
+    sl.getDailyCost(dailyData(0, 'b'), env)
+    sl.getDailyCost(dailyData(3, 'a'), env)
+    sl.getDailyCost(dailyData(2, 'b'), env)
+    sl.getDailyCost(dailyData(4, 'a'), env)
+    sl.getDailyCost(dailyData(2.5, 'b'), env)
+    sl.getDailyCost(dailyData(5, 'a'), env)
+    expect(sl.getDailyCost(dailyData(3, 'b'), env)).toBeCloseTo(8)
   })
 })
