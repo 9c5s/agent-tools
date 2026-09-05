@@ -104,7 +104,7 @@
   },
   "statusLine": {
     "type": "command",
-    "command": "uv run ~/.claude/scripts/statusline.py --icons=nerd",
+    "command": "bun ~/.claude/scripts/statusline.ts --icons=nerd",
     "padding": 0
   },
   "enabledPlugins": {
