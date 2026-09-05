@@ -80,9 +80,14 @@ function stripInlineCode(text: string): string {
   return text.replace(/`[^`\n]*`/g, '')
 }
 
+// def の直後の定義名を取り除く (日本語を含む関数名の内部は境界を分けられないため)
+function stripDefinitionNames(text: string): string {
+  return text.replace(/\bdef\s+[^\s(]+/gu, 'def')
+}
+
 // 日本語を含む行だけを検査の対象にする (コードや英文の行で誤検知しないため)
 function japaneseLines(text: string): string[] {
-  return stripInlineCode(stripCodeBlocks(text))
+  return stripDefinitionNames(stripInlineCode(stripCodeBlocks(text)))
     .split('\n')
     .filter((line) => JA_RE.test(line))
 }
