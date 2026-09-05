@@ -378,3 +378,9 @@ test('checkVocabulary は「回す」を口語動詞として検知する', () =
   expect(checkVocabulary('検証を回すための道具').join('')).toContain('回す')
   expect(checkVocabulary('行を使い回すプール式').join('')).toContain('回す')
 })
+
+test('checkVocabulary は欠落と合流と前倒しを口語動詞として検知しない', () => {
+  expect(checkVocabulary('無ければ欠落として拒否する')).toEqual([])
+  expect(checkVocabulary('既存の誘導に合流する')).toEqual([])
+  expect(checkVocabulary('Task 1 を前倒しで進める')).toEqual([])
+})
