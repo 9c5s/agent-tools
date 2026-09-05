@@ -342,3 +342,139 @@ export async function cachedFetch<T>(env: Env, options: CachedFetchOptions<T>): 
   writeCache(options.path, { ...options.cacheKey, _cached_at: now, data })
   return data
 }
+
+const API_TIMEOUT_MS = 5000
+const EXCHANGE_API_URL = 'https://api.frankfurter.app/latest?from=USD&to='
+
+export type CurrencyInfo = { symbol: string; decimals: number }
+
+export const CURRENCIES: Record<string, CurrencyInfo> = {
+  USD: { symbol: '$', decimals: 2 },
+  EUR: { symbol: '€', decimals: 2 },
+  GBP: { symbol: '£', decimals: 2 },
+  JPY: { symbol: '¥', decimals: 0 },
+  CNY: { symbol: '¥', decimals: 2 },
+  KRW: { symbol: '₩', decimals: 0 },
+  INR: { symbol: '₹', decimals: 2 },
+  CAD: { symbol: 'C$', decimals: 2 },
+  AUD: { symbol: 'A$', decimals: 2 },
+  CHF: { symbol: 'CHF', decimals: 2 },
+  BRL: { symbol: 'R$', decimals: 2 },
+  SEK: { symbol: 'kr', decimals: 2 },
+  NOK: { symbol: 'kr', decimals: 2 },
+  DKK: { symbol: 'kr', decimals: 2 },
+  PLN: { symbol: 'zł', decimals: 2 },
+  CZK: { symbol: 'Kč', decimals: 2 },
+  SGD: { symbol: 'S$', decimals: 2 },
+  HKD: { symbol: 'HK$', decimals: 2 },
+  MXN: { symbol: 'MX$', decimals: 2 },
+  HUF: { symbol: 'Ft', decimals: 0 },
+  IDR: { symbol: 'Rp', decimals: 0 },
+  ILS: { symbol: '₪', decimals: 2 },
+  ISK: { symbol: 'kr', decimals: 0 },
+  MYR: { symbol: 'RM', decimals: 2 },
+  NZD: { symbol: 'NZ$', decimals: 2 },
+  PHP: { symbol: '₱', decimals: 2 },
+  RON: { symbol: 'lei', decimals: 2 },
+  THB: { symbol: '฿', decimals: 2 },
+  TRY: { symbol: '₺', decimals: 2 },
+  ZAR: { symbol: 'R', decimals: 2 },
+}
+
+export const LOCALE_TO_CURRENCY: Record<string, string> = {
+  JP: 'JPY',
+  US: 'USD',
+  GB: 'GBP',
+  DE: 'EUR',
+  FR: 'EUR',
+  IT: 'EUR',
+  ES: 'EUR',
+  NL: 'EUR',
+  BE: 'EUR',
+  AT: 'EUR',
+  FI: 'EUR',
+  IE: 'EUR',
+  PT: 'EUR',
+  GR: 'EUR',
+  LU: 'EUR',
+  CN: 'CNY',
+  KR: 'KRW',
+  IN: 'INR',
+  CA: 'CAD',
+  AU: 'AUD',
+  CH: 'CHF',
+  BR: 'BRL',
+  SE: 'SEK',
+  NO: 'NOK',
+  DK: 'DKK',
+  PL: 'PLN',
+  CZ: 'CZK',
+  SG: 'SGD',
+  HK: 'HKD',
+  MX: 'MXN',
+  HU: 'HUF',
+  ID: 'IDR',
+  IL: 'ILS',
+  IS: 'ISK',
+  MY: 'MYR',
+  NZ: 'NZD',
+  PH: 'PHP',
+  RO: 'RON',
+  TH: 'THB',
+  TR: 'TRY',
+  ZA: 'ZAR',
+}
+
+// BCP 47 のロケール ("ja-JP" など) の地域から通貨コードを決める (決まらなければ USD)
+export function currencyFromLocale(locale: string): string {
+  const region = locale
+    .split(/[-_.]/)
+    .slice(1)
+    .find((part) => /^[A-Za-z]{2}$/.test(part))
+  const currency = region === undefined ? undefined : LOCALE_TO_CURRENCY[region.toUpperCase()]
+  return currency ?? 'USD'
+}
+
+// 優先順位は CLI 引数、ロケール、USD
+export function resolveCurrency(arg: string | undefined, env: Env): string {
+  if (arg !== undefined && Object.hasOwn(CURRENCIES, arg)) return arg
+  const fromLocale = currencyFromLocale(env.locale())
+  return Object.hasOwn(CURRENCIES, fromLocale) ? fromLocale : 'USD'
+}
+
+function isNumber(value: unknown): value is number {
+  return typeof value === 'number'
+}
+
+// USD から指定通貨への為替レート (日付が変わるまでキャッシュする)
+export async function getExchangeRate(currency: string, env: Env): Promise<number | null> {
+  if (currency === 'USD') return null
+  return cachedFetch(env, {
+    path: cachePath(env, CACHE_FILES.exchange),
+    ttl: Number.POSITIVE_INFINITY,
+    cacheKey: { currency, date: today(env) },
+    isValid: isNumber,
+    fetch: async () => {
+      const res = await env.fetch(`${EXCHANGE_API_URL}${currency}`, {
+        headers: { 'User-Agent': 'statusline/1.0' },
+        signal: AbortSignal.timeout(API_TIMEOUT_MS),
+      })
+      if (!res.ok) throw new Error(`exchange api returned ${res.status}`)
+      const body: unknown = await res.json()
+      const rate = isRecord(body) && isRecord(body.rates) ? safeFloat(body.rates[currency]) : null
+      if (rate === null) throw new Error(`rate not found for ${currency}`)
+      return rate
+    },
+  })
+}
+
+// コストを ctx の通貨で整形する (レートが取れないときは USD のまま)
+export async function formatCost(costUsd: number, ctx: Ctx): Promise<string> {
+  const usd = `$${formatAmount(costUsd, 2)}`
+  if (ctx.currency === 'USD') return usd
+  const info = CURRENCIES[ctx.currency]
+  if (info === undefined) return usd
+  const rate = await getExchangeRate(ctx.currency, ctx.env)
+  if (rate === null) return usd
+  return `${info.symbol}${formatAmount(costUsd * rate, info.decimals)}`
+}

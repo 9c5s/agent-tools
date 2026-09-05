@@ -452,3 +452,179 @@ describe('cachedFetch', () => {
     ).toBe(9)
   })
 })
+
+function makeCtx(overrides: Partial<sl.Ctx> = {}): sl.Ctx {
+  return { icons: sl.ICONS_EMOJI, currency: 'USD', env: makeEnv(), ...overrides }
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status })
+}
+
+describe('currencyFromLocale', () => {
+  test.each([
+    ['ja-JP', 'JPY'],
+    ['en-US', 'USD'],
+    ['en-GB', 'GBP'],
+    ['de-DE', 'EUR'],
+    ['ko-KR', 'KRW'],
+    ['ja_JP.UTF-8', 'JPY'],
+    ['sr-Latn-RS', 'USD'],
+    ['xx-XX', 'USD'],
+    ['ja', 'USD'],
+    ['', 'USD'],
+  ])('%s は %s', (locale, expected) => {
+    expect(sl.currencyFromLocale(locale)).toBe(expected)
+  })
+})
+
+describe('CURRENCIES と LOCALE_TO_CURRENCY', () => {
+  test('主要通貨の記号と桁数を持つ', () => {
+    expect(sl.CURRENCIES.USD).toEqual({ symbol: '$', decimals: 2 })
+    expect(sl.CURRENCIES.JPY).toEqual({ symbol: '¥', decimals: 0 })
+    expect(sl.CURRENCIES.THB).toEqual({ symbol: '฿', decimals: 2 })
+    expect(sl.CURRENCIES.TRY).toEqual({ symbol: '₺', decimals: 2 })
+    expect(sl.CURRENCIES.TWD).toBeUndefined()
+  })
+
+  test('ロケールの地域から通貨へ対応づける', () => {
+    expect(sl.LOCALE_TO_CURRENCY.JP).toBe('JPY')
+    expect(sl.LOCALE_TO_CURRENCY.US).toBe('USD')
+    expect(sl.LOCALE_TO_CURRENCY.TW).toBeUndefined()
+  })
+
+  test('対応づけ先の通貨はすべて CURRENCIES にある', () => {
+    for (const code of Object.values(sl.LOCALE_TO_CURRENCY)) {
+      expect(sl.CURRENCIES[code]).toBeDefined()
+    }
+  })
+})
+
+describe('resolveCurrency', () => {
+  test('引数の通貨が対応していればそれを使う', () => {
+    expect(sl.resolveCurrency('JPY', makeEnv({ locale: () => 'en-US' }))).toBe('JPY')
+  })
+
+  test('引数の通貨が未対応ならロケールで決める', () => {
+    expect(sl.resolveCurrency('XXX', makeEnv({ locale: () => 'de-DE' }))).toBe('EUR')
+  })
+
+  test('引数が無ければロケールで決める', () => {
+    expect(sl.resolveCurrency(undefined, makeEnv({ locale: () => 'ja-JP' }))).toBe('JPY')
+  })
+
+  test('ロケールからも決まらなければ USD', () => {
+    expect(sl.resolveCurrency(undefined, makeEnv({ locale: () => 'xx' }))).toBe('USD')
+  })
+
+  test('プロトタイプのキーは通貨として扱わない', () => {
+    expect(sl.resolveCurrency('constructor', makeEnv({ locale: () => 'en-US' }))).toBe('USD')
+  })
+})
+
+describe('getExchangeRate', () => {
+  test('USD は変換不要なので null', async () => {
+    expect(await sl.getExchangeRate('USD', makeEnv())).toBeNull()
+  })
+
+  test('API からレートを取り、通貨と日付をキーに保存する', async () => {
+    const fetch = mock(async (_input: string | URL | Request) =>
+      jsonResponse({ rates: { JPY: 150.5 } }),
+    )
+    const env = makeEnv({ fetch })
+    expect(await sl.getExchangeRate('JPY', env)).toBe(150.5)
+    const url = String(fetch.mock.calls[0]?.[0])
+    expect(url).toBe('https://api.frankfurter.app/latest?from=USD&to=JPY')
+    expect(readJson(sl.cachePath(env, sl.CACHE_FILES.exchange))).toEqual({
+      currency: 'JPY',
+      date: sl.today(env),
+      _cached_at: NOW,
+      data: 150.5,
+    })
+  })
+
+  test('同じ日の同じ通貨のキャッシュがあれば API を呼ばない', async () => {
+    const fetch = mock(async () => jsonResponse({ rates: { JPY: 1 } }))
+    const env = makeEnv({ fetch })
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.exchange), {
+      _cached_at: NOW - 86_400 * 30,
+      data: 149,
+      currency: 'JPY',
+      date: sl.today(env),
+    })
+    expect(await sl.getExchangeRate('JPY', env)).toBe(149)
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  test('API に失敗したら期限切れ (別の日) のキャッシュを返す', async () => {
+    const env = makeEnv()
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.exchange), {
+      _cached_at: 0,
+      data: 148,
+      currency: 'JPY',
+      date: sl.today(env),
+    })
+    expect(await sl.getExchangeRate('JPY', env)).toBe(148)
+  })
+
+  test('API に失敗しキャッシュも無ければ null', async () => {
+    expect(await sl.getExchangeRate('JPY', makeEnv())).toBeNull()
+  })
+
+  test('応答にレートが無ければ null', async () => {
+    const env = makeEnv({ fetch: async () => jsonResponse({ rates: {} }) })
+    expect(await sl.getExchangeRate('JPY', env)).toBeNull()
+  })
+
+  test('応答がエラーなら null', async () => {
+    const env = makeEnv({ fetch: async () => jsonResponse({}, 500) })
+    expect(await sl.getExchangeRate('JPY', env)).toBeNull()
+  })
+
+  test('通貨が違うキャッシュは無視して取り直す', async () => {
+    const env = makeEnv({ fetch: async () => jsonResponse({ rates: { JPY: 150 } }) })
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.exchange), {
+      _cached_at: NOW,
+      data: 0.92,
+      currency: 'EUR',
+      date: sl.today(env),
+    })
+    expect(await sl.getExchangeRate('JPY', env)).toBe(150)
+  })
+})
+
+describe('formatCost', () => {
+  function ctxWithRate(currency: string, rate: number): sl.Ctx {
+    const env = makeEnv()
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.exchange), {
+      _cached_at: NOW,
+      data: rate,
+      currency,
+      date: sl.today(env),
+    })
+    return makeCtx({ currency, env })
+  }
+
+  test('USD はそのまま $ 表示', async () => {
+    expect(await sl.formatCost(1.23, makeCtx())).toBe('$1.23')
+    expect(await sl.formatCost(1234.56, makeCtx())).toBe('$1,234.56')
+  })
+
+  test('JPY は小数なしで、184.5 円は偶数丸めで ¥184', async () => {
+    expect(await sl.formatCost(1.23, ctxWithRate('JPY', 150))).toBe('¥184')
+    expect(await sl.formatCost(10, ctxWithRate('JPY', 150))).toBe('¥1,500')
+  })
+
+  test('EUR は小数 2 桁', async () => {
+    expect(await sl.formatCost(1, ctxWithRate('EUR', 0.92))).toBe('€0.92')
+    expect(await sl.formatCost(2000, ctxWithRate('EUR', 0.92))).toBe('€1,840.00')
+  })
+
+  test('レートが取れなければ USD 表示', async () => {
+    expect(await sl.formatCost(1.23, makeCtx({ currency: 'JPY' }))).toBe('$1.23')
+  })
+
+  test('未知の通貨は USD 表示', async () => {
+    expect(await sl.formatCost(1.23, ctxWithRate('XYZ', 1.5))).toBe('$1.23')
+  })
+})
