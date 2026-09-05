@@ -478,3 +478,39 @@ export async function formatCost(costUsd: number, ctx: Ctx): Promise<string> {
   if (rate === null) return usd
   return `${info.symbol}${formatAmount(costUsd * rate, info.decimals)}`
 }
+
+const GIT_CACHE_TTL = 5
+
+export type GitInfo = { branch: string; remote_url?: string }
+
+function isGitInfo(value: unknown): value is GitInfo {
+  return (
+    isRecord(value) &&
+    typeof value.branch === 'string' &&
+    (value.remote_url === undefined || typeof value.remote_url === 'string')
+  )
+}
+
+// git のブランチ名 (detached HEAD では短縮ハッシュ) とリモート URL を取る
+export function fetchGitInfo(cwd: string, env: Env): GitInfo {
+  const run = (...args: string[]): string => {
+    const result = env.spawnSync(['git', ...args], cwd || undefined)
+    return result.exitCode === 0 ? result.stdout.trim() : ''
+  }
+  let branch = run('rev-parse', '--abbrev-ref', 'HEAD')
+  if (branch === 'HEAD') branch = run('rev-parse', '--short', 'HEAD')
+  if (!branch) throw new Error('git branch not detected')
+  const remote = run('remote', 'get-url', 'origin')
+  return remote ? { branch, remote_url: remote } : { branch }
+}
+
+// cwd をキーに 5 秒キャッシュする
+export function getGitInfo(cwd: string, env: Env): Promise<GitInfo | null> {
+  return cachedFetch(env, {
+    path: cachePath(env, CACHE_FILES.git),
+    ttl: GIT_CACHE_TTL,
+    cacheKey: { cwd },
+    isValid: isGitInfo,
+    fetch: async () => fetchGitInfo(cwd, env),
+  })
+}
