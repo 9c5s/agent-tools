@@ -341,3 +341,40 @@ test('checkVocabulary は記載と流用を口語動詞として検知しない'
   expect(checkVocabulary('経緯を記載する')).toEqual([])
   expect(checkVocabulary('設定を流用する')).toEqual([])
 })
+
+test('checkNotation は括弧の内側の列挙の半角カンマを検知しない', () => {
+  expect(checkNotation('(幅, 高さ) を px で返す')).toEqual([])
+  expect(checkNotation('いま押せるボタン一覧（idx, x,y, 階層パス, ラベル）')).toEqual([])
+  expect(checkNotation('Min(値, 定数マスター STAR_RATE_MAX = 3000) でクリップする')).toEqual([])
+})
+
+test('checkNotation は括弧の外側の半角カンマは検知する', () => {
+  expect(checkNotation('(幅, 高さ) を返し, 呼び出し元で使う').join('')).toContain('句読点')
+})
+
+test('checkNotation は日本語の直後の省略記号を検知しない', () => {
+  expect(checkNotation('raw <文字列...>  任意のコマンド文字列を送る')).toEqual([])
+})
+
+test('checkNotation はコメント見出しのラベル区切りの em ダッシュを検知しない', () => {
+  expect(checkNotation('// control.h — 制御ソケット: 画面状態を問い合わせる')).toEqual([])
+  expect(checkNotation('# build_mod_arm64.py — Mod の APK を生成する')).toEqual([])
+})
+
+test('checkNotation はコメント行でも 2 倍ダッシュを検知する', () => {
+  expect(checkNotation('// この方式——分割して扱う方法——を採る').join('')).toContain('ダッシュ')
+})
+
+test('checkVocabulary はエスケープシーケンスの直後の日本語を境界の違反にしない', () => {
+  expect(checkVocabulary('print(f"\\n完了: {out}")')).toEqual([])
+})
+
+test('checkVocabulary は巡回と周回を口語動詞として検知しない', () => {
+  expect(checkVocabulary('押すたびに表示が巡回する')).toEqual([])
+  expect(checkVocabulary('同じクエストを周回する')).toEqual([])
+})
+
+test('checkVocabulary は「回す」を口語動詞として検知する', () => {
+  expect(checkVocabulary('検証を回すための道具').join('')).toContain('回す')
+  expect(checkVocabulary('行を使い回すプール式').join('')).toContain('回す')
+})
