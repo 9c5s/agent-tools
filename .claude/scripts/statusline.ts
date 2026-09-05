@@ -578,3 +578,170 @@ export function getDailyCost(data: Input, env: Env): number | null {
     return accumulated
   })
 }
+
+const USAGE_API_URL = 'https://api.anthropic.com/api/oauth/usage'
+const MODEL_USAGE_TTL = 300 // 秒。Claude Code 本体のキャッシュ TTL と揃える
+const MODEL_USAGE_RETRY_INTERVAL = 60 // 秒。取得失敗時の再試行を抑える間隔
+const MODEL_USAGE_STALE = 900 // 秒。これを超えて更新が止まったキャッシュは表示に使わない
+
+export type ModelUsageEntry = { display_name: string; percent: number; resets_at: number | null }
+export type RateBucket = { used_percentage: number; resets_at: number }
+export type UsageSnapshot = { weekly: RateBucket | null; model_scoped: ModelUsageEntry[] }
+export type ModelUsage = { entries: ModelUsageEntry[] | null; weekly: RateBucket | null }
+
+function isModelUsageEntry(value: unknown): value is ModelUsageEntry {
+  return (
+    isRecord(value) &&
+    typeof value.display_name === 'string' &&
+    typeof value.percent === 'number' &&
+    (value.resets_at === null || typeof value.resets_at === 'number')
+  )
+}
+
+function isRateBucket(value: unknown): value is RateBucket {
+  return (
+    isRecord(value) &&
+    typeof value.used_percentage === 'number' &&
+    typeof value.resets_at === 'number'
+  )
+}
+
+// Claude Code の認証情報から期限内の access token を読む
+// トークンの更新は Claude Code 本体の責務なので、ここでは行わない
+export function readAccessToken(env: Env): string | null {
+  try {
+    const path = join(env.homeDir(), '.claude', '.credentials.json')
+    const creds: unknown = JSON.parse(readFileSync(path, 'utf8'))
+    const oauth = isRecord(creds) ? creds.claudeAiOauth : undefined
+    if (!isRecord(oauth)) return null
+    const token = oauth.accessToken
+    if (typeof token !== 'string' || token === '') return null
+    const expiresAt = safeFloat(oauth.expiresAt)
+    if (expiresAt !== null && expiresAt <= env.now() * 1000) return null
+    return token
+  } catch {
+    return null
+  }
+}
+
+// ISO 8601 の文字列を epoch 秒にする (不正な値は null)
+export function parseIsoTimestamp(value: unknown): number | null {
+  if (typeof value !== 'string') return null
+  const ms = Date.parse(value)
+  return Number.isNaN(ms) ? null : ms / 1000
+}
+
+// limits 配列の 1 要素をモデル別の週次枠にする (weekly_scoped かつ scope.model を持つものだけ)
+export function toModelUsageEntry(item: unknown): ModelUsageEntry | null {
+  if (!isRecord(item) || item.kind !== 'weekly_scoped') return null
+  const model = isRecord(item.scope) ? item.scope.model : undefined
+  const name = isRecord(model) ? model.display_name : undefined
+  const percent = safeFloat(item.percent)
+  if (typeof name !== 'string' || name === '' || percent === null) return null
+  return { display_name: name, percent, resets_at: parseIsoTimestamp(item.resets_at) }
+}
+
+// limits 配列の 1 要素を週次全体のバケットにする (weekly_all でリセット時刻を持つものだけ)
+export function toWeeklyBucket(item: unknown): RateBucket | null {
+  if (!isRecord(item) || item.kind !== 'weekly_all') return null
+  const percent = safeFloat(item.percent)
+  const ts = parseIsoTimestamp(item.resets_at)
+  if (percent === null || ts === null) return null
+  return { used_percentage: percent, resets_at: ts }
+}
+
+// 使用量 API から週次の使用状況を取る (statusline の stdin にはモデル別の枠が無い)
+// 7d 全体も同じ応答から取り、括弧内の内訳と表示時点を揃える
+export async function fetchUsageSnapshot(env: Env): Promise<UsageSnapshot | null> {
+  const token = readAccessToken(env)
+  if (token === null) return null
+  let body: unknown
+  try {
+    const res = await env.fetch(USAGE_API_URL, {
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(API_TIMEOUT_MS),
+    })
+    if (!res.ok) return null
+    body = await res.json()
+  } catch {
+    return null
+  }
+  if (!isRecord(body)) return null
+  if (!Array.isArray(body.limits)) return { weekly: null, model_scoped: [] }
+  let weekly: RateBucket | null = null
+  const entries: ModelUsageEntry[] = []
+  for (const item of body.limits) {
+    const entry = toModelUsageEntry(item)
+    if (entry) entries.push(entry)
+    else if (weekly === null) weekly = toWeeklyBucket(item)
+  }
+  return { weekly, model_scoped: entries }
+}
+
+// 最後に取得できてから STALE 以内のキャッシュか
+export function isUsageCacheUsable(cache: CacheObject, now: number): boolean {
+  const cachedAt = safeFloat(cache._cached_at)
+  return cachedAt !== null && now - cachedAt < MODEL_USAGE_STALE
+}
+
+// 更新の試行時刻を記録する (子プロセスの起動前に記録し、取得中の描画で重複起動させない)
+export function markUsageAttempt(env: Env, now: number): void {
+  const path = cachePath(env, CACHE_FILES.modelUsage)
+  withFileLock(path, () => {
+    writeCache(path, { ...readCacheObject(path), _attempted_at: now })
+  })
+}
+
+// Windows は CREATE_NO_WINDOW に当たる windowsHide だけを付ける
+// (DETACHED_PROCESS と併用すると CREATE_NO_WINDOW は無視される)
+export function refreshSpawnOptions(platform: string): RefreshSpawnOptions {
+  return platform === 'win32' ? { windowsHide: true } : { detached: true }
+}
+
+// 使用量キャッシュを更新する子プロセスを起動する (結果は待たず次回の描画で反映する)
+export function spawnUsageRefresh(env: Env): void {
+  try {
+    env.spawn(
+      [process.execPath, import.meta.path, '--refresh-usage'],
+      refreshSpawnOptions(process.platform),
+    )
+  } catch {
+    // 起動できなくても描画は続ける
+  }
+}
+
+// 使用量キャッシュから週次バケットとモデル別の内訳を取る (この経路では HTTP を発行しない)
+// TTL を超えていれば古い値を返しつつ更新を起動し、STALE を超えた値は返さない
+export function getModelUsage(env: Env): ModelUsage {
+  const cache = readCacheObject(cachePath(env, CACHE_FILES.modelUsage))
+  const now = env.now()
+  const usable = isUsageCacheUsable(cache, now)
+  const entries = usable && Array.isArray(cache.data) ? cache.data.filter(isModelUsageEntry) : null
+  const weekly = usable && isRateBucket(cache.weekly) ? cache.weekly : null
+  const cachedAt = safeFloat(cache._cached_at) ?? 0
+  const attemptedAt = safeFloat(cache._attempted_at) ?? 0
+  const fresh = entries !== null && now - cachedAt < MODEL_USAGE_TTL
+  if (!fresh && now - attemptedAt >= MODEL_USAGE_RETRY_INTERVAL) {
+    markUsageAttempt(env, now)
+    spawnUsageRefresh(env)
+  }
+  return { entries, weekly }
+}
+
+// 使用量 API を取ってキャッシュを更新する (--refresh-usage 用)
+// HTTP はロックの外で行い、失敗時は試行時刻だけ更新して既存の値を保つ
+export async function refreshModelUsage(env: Env): Promise<void> {
+  const snapshot = await fetchUsageSnapshot(env)
+  const now = env.now()
+  const path = cachePath(env, CACHE_FILES.modelUsage)
+  withFileLock(path, () => {
+    const cache = readCacheObject(path)
+    cache._attempted_at = now
+    if (snapshot) {
+      cache._cached_at = now
+      cache.data = snapshot.model_scoped
+      cache.weekly = snapshot.weekly
+    }
+    writeCache(path, cache)
+  })
+}
