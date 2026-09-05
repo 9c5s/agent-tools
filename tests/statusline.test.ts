@@ -1410,3 +1410,229 @@ describe('segLines', () => {
     expect(sl.segLines({ cost: { total_lines_added: 'abc' } }, makeCtx())).toBeNull()
   })
 })
+
+describe('modelUsageSuffix', () => {
+  test('最も高い利用率を括弧で色付きに返す', () => {
+    const entries: sl.ModelUsageEntry[] = [
+      { display_name: 'Sonnet', percent: 10, resets_at: null },
+      { display_name: 'Fable', percent: 88, resets_at: null },
+    ]
+    expect(sl.modelUsageSuffix(entries)).toBe(`(${sl.colorize('88%', sl.Color.red)})`)
+  })
+
+  test('無い、空、有限でない場合は空文字', () => {
+    expect(sl.modelUsageSuffix(null)).toBe('')
+    expect(sl.modelUsageSuffix([])).toBe('')
+    expect(sl.modelUsageSuffix([{ display_name: 'X', percent: Number.NaN, resets_at: null }])).toBe(
+      '',
+    )
+  })
+})
+
+describe('segRate5h', () => {
+  const data: sl.Input = {
+    rate_limits: { five_hour: { used_percentage: 45.0, resets_at: 1736951400 } },
+  }
+
+  test('利用率とリセット時刻を表示する', () => {
+    const reset = sl.formatResetTimeShort(1736951400)
+    expect(sl.segRate5h(data, makeCtx())).toBe(
+      `${sl.ICONS_EMOJI.clock} ${sl.colorize('45%', sl.Color.green)} ${sl.ICONS_EMOJI.reset} ${reset}`,
+    )
+  })
+
+  test('80% 以上は赤', () => {
+    const hot = { rate_limits: { five_hour: { used_percentage: 85, resets_at: 1736951400 } } }
+    expect(sl.segRate5h(hot, makeCtx())).toContain('\x1b[31m85%')
+  })
+
+  test('rate_limits やバケットが無い、値が欠けている、数値でない、有限でない、時刻が不正なら null', () => {
+    expect(sl.segRate5h({}, makeCtx())).toBeNull()
+    expect(sl.segRate5h({ rate_limits: {} }, makeCtx())).toBeNull()
+    expect(sl.segRate5h({ rate_limits: { five_hour: { resets_at: 1 } } }, makeCtx())).toBeNull()
+    expect(
+      sl.segRate5h(
+        { rate_limits: { five_hour: { used_percentage: 'x', resets_at: 1 } } },
+        makeCtx(),
+      ),
+    ).toBeNull()
+    expect(
+      sl.segRate5h({ rate_limits: { five_hour: { used_percentage: 45 } } }, makeCtx()),
+    ).toBeNull()
+    expect(
+      sl.segRate5h(
+        {
+          rate_limits: { five_hour: { used_percentage: 45, resets_at: Number.POSITIVE_INFINITY } },
+        },
+        makeCtx(),
+      ),
+    ).toBeNull()
+    expect(
+      sl.segRate5h(
+        { rate_limits: { five_hour: { used_percentage: 45, resets_at: 1e20 } } },
+        makeCtx(),
+      ),
+    ).toBeNull()
+  })
+
+  test('モデル別の内訳は付けない', () => {
+    const env = makeEnv()
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage), {
+      _cached_at: NOW,
+      _attempted_at: NOW,
+      data: [{ display_name: 'Fable', percent: 88, resets_at: null }],
+    })
+    expect(sl.segRate5h(data, makeCtx({ env }))).not.toContain('(')
+  })
+})
+
+describe('segRate7d', () => {
+  const data: sl.Input = {
+    rate_limits: { seven_day: { used_percentage: 51, resets_at: 1787454000 } },
+  }
+
+  function envWithUsage(entries: sl.ModelUsageEntry[] | null, weekly?: sl.RateBucket): sl.Env {
+    const env = makeEnv()
+    if (entries !== null || weekly !== undefined) {
+      writeJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage), {
+        _cached_at: NOW,
+        _attempted_at: NOW,
+        data: entries ?? [],
+        weekly: weekly ?? null,
+      })
+    }
+    return env
+  }
+
+  test('利用率とリセット日時を表示する', () => {
+    const reset = sl.formatResetDate(1787454000)
+    const env = envWithUsage([])
+    expect(sl.segRate7d(data, makeCtx({ env }))).toBe(
+      `${sl.ICONS_EMOJI.calendar} ${sl.colorize('51%', sl.Color.green)} ${sl.ICONS_EMOJI.reset} ${reset}`,
+    )
+  })
+
+  test('モデル別枠を利用率の直後へ括弧で付け、それぞれの利用率で色を付ける', () => {
+    const env = envWithUsage([{ display_name: 'Fable', percent: 88, resets_at: null }])
+    const text = sl.segRate7d(data, makeCtx({ env })) ?? ''
+    expect(text).toContain(
+      `${sl.colorize('51%', sl.Color.green)}(${sl.colorize('88%', sl.Color.red)})`,
+    )
+  })
+
+  test('複数の枠では利用率が最も高いものを付ける', () => {
+    const env = envWithUsage([
+      { display_name: 'Sonnet', percent: 10, resets_at: null },
+      { display_name: 'Fable', percent: 88, resets_at: null },
+    ])
+    const text = sl.segRate7d(data, makeCtx({ env })) ?? ''
+    expect(text).toContain('88%')
+    expect(text).not.toContain('10%')
+  })
+
+  test('モデル別枠が無ければ括弧を出さない', () => {
+    expect(sl.segRate7d(data, makeCtx({ env: envWithUsage(null) }))).not.toContain('(')
+  })
+
+  test('キャッシュに週次値があれば stdin の値より優先する', () => {
+    const env = envWithUsage([], { used_percentage: 60, resets_at: 1787454000 })
+    const text = sl.segRate7d(data, makeCtx({ env })) ?? ''
+    expect(text).toContain('60%')
+    expect(text).not.toContain('51%')
+  })
+
+  test('キャッシュが STALE を超えていれば stdin の値を使う', () => {
+    const env = makeEnv()
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage), {
+      _cached_at: NOW - 10_000,
+      _attempted_at: NOW,
+      data: [{ display_name: 'Fable', percent: 88, resets_at: null }],
+      weekly: { used_percentage: 60, resets_at: 1787454000 },
+    })
+    const text = sl.segRate7d(data, makeCtx({ env })) ?? ''
+    expect(text).toContain('51%')
+    expect(text).not.toContain('60%')
+    expect(text).not.toContain('(')
+  })
+
+  test('rate_limits が無ければ null でキャッシュにも触れない', () => {
+    const spawn = mock(() => undefined)
+    expect(sl.segRate7d({}, makeCtx({ env: makeEnv({ spawn }) }))).toBeNull()
+    expect(spawn).not.toHaveBeenCalled()
+  })
+
+  test('入力オブジェクトを書き換えない', () => {
+    const env = envWithUsage([], { used_percentage: 60, resets_at: 1787454000 })
+    const input = structuredClone(data)
+    sl.segRate7d(input, makeCtx({ env }))
+    expect(input).toEqual(data)
+  })
+})
+
+describe('segSessionCost', () => {
+  test('セッションコストを通貨で表示する', async () => {
+    const env = makeEnv()
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.sessionCost), { sessions: { s1: 0 } })
+    const data = { cost: { total_cost_usd: 1.23 }, session_id: 's1' }
+    expect(await sl.segSessionCost(data, makeCtx({ env }))).toBe(
+      `${sl.ICONS_EMOJI.money} $1.23 (session)`,
+    )
+  })
+
+  test('JPY なら ¥ で表示する', async () => {
+    const env = makeEnv()
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.exchange), {
+      _cached_at: NOW,
+      data: 150,
+      currency: 'JPY',
+      date: sl.today(env),
+    })
+    const data = { cost: { total_cost_usd: 1.23 } }
+    expect(await sl.segSessionCost(data, makeCtx({ currency: 'JPY', env }))).toContain('¥184')
+  })
+
+  test('cost が無い、total_cost_usd が無い、数値でない場合は null', async () => {
+    expect(await sl.segSessionCost({}, makeCtx())).toBeNull()
+    expect(await sl.segSessionCost({ cost: {} }, makeCtx())).toBeNull()
+    expect(await sl.segSessionCost({ cost: { total_cost_usd: 'abc' } }, makeCtx())).toBeNull()
+  })
+})
+
+describe('segDailyCost', () => {
+  test('日次コストを通貨で表示する', async () => {
+    const env = makeEnv()
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.dailyCost), {
+      date: sl.today(env),
+      sessions: { s1: 1 },
+      accumulated: 2,
+    })
+    const data = { cost: { total_cost_usd: 1.5 }, session_id: 's1' }
+    expect(await sl.segDailyCost(data, makeCtx({ env }))).toBe(
+      `${sl.ICONS_EMOJI.money} $2.50 (daily)`,
+    )
+  })
+
+  test('累積が 0 以下、または cost が無ければ null', async () => {
+    const env = makeEnv()
+    const first = { cost: { total_cost_usd: 1 }, session_id: 's1' }
+    expect(await sl.segDailyCost(first, makeCtx({ env }))).toBeNull()
+    expect(await sl.segDailyCost({}, makeCtx())).toBeNull()
+  })
+
+  test('JPY なら ¥ で表示する', async () => {
+    const env = makeEnv()
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.exchange), {
+      _cached_at: NOW,
+      data: 150,
+      currency: 'JPY',
+      date: sl.today(env),
+    })
+    writeJson(sl.cachePath(env, sl.CACHE_FILES.dailyCost), {
+      date: sl.today(env),
+      sessions: { s1: 0 },
+      accumulated: 0,
+    })
+    const data = { cost: { total_cost_usd: 1.23 }, session_id: 's1' }
+    expect(await sl.segDailyCost(data, makeCtx({ currency: 'JPY', env }))).toContain('¥184')
+  })
+})

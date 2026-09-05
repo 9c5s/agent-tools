@@ -852,3 +852,63 @@ export function segLines(data: Input, ctx: Ctx): string | null {
   if (added === 0 && removed === 0) return null
   return `${ctx.icons.pencil} ${colorize(`+${added}`, Color.green)}/${colorize(`-${removed}`, Color.red)}`
 }
+
+// モデル別の週次枠のうち上限に最も近いものを括弧で返す (無ければ空文字)
+export function modelUsageSuffix(entries: ModelUsageEntry[] | null): string {
+  if (!entries || entries.length === 0) return ''
+  const top = entries.reduce((a, b) => (b.percent > a.percent ? b : a))
+  if (!Number.isFinite(top.percent)) return ''
+  return `(${colorize(`${Math.trunc(top.percent)}%`, colorForUtilization(top.percent))})`
+}
+
+// レートリミットの 1 バケットを "icon pct%suffix reset time" に整形する
+function rateSegment(
+  bucket: unknown,
+  icon: string,
+  resetIcon: string,
+  formatReset: (ts: number) => string | null,
+  suffix = '',
+): string | null {
+  if (!isRecord(bucket)) return null
+  const pct = safeFloat(bucket.used_percentage)
+  const ts = safeFloat(bucket.resets_at)
+  if (pct === null || ts === null || !Number.isFinite(pct) || !Number.isFinite(ts)) return null
+  const reset = formatReset(ts)
+  if (reset === null) return null
+  const coloredPct = colorize(`${Math.trunc(pct)}%`, colorForUtilization(pct))
+  return `${icon} ${coloredPct}${suffix} ${resetIcon} ${reset}`
+}
+
+// 5 時間のレートリミット
+export function segRate5h(data: Input, ctx: Ctx): string | null {
+  const limits = data.rate_limits
+  if (!isRecord(limits)) return null
+  return rateSegment(limits.five_hour, ctx.icons.clock, ctx.icons.reset, formatResetTimeShort)
+}
+
+// 7 日のレートリミット。モデル別の内訳を括弧で併記し、
+// 内訳と表示時点を揃えるため通常値も使用量キャッシュにあればそちらを使う
+export function segRate7d(data: Input, ctx: Ctx): string | null {
+  const limits = data.rate_limits
+  if (!isRecord(limits)) return null
+  const usage = getModelUsage(ctx.env)
+  return rateSegment(
+    usage.weekly ?? limits.seven_day,
+    ctx.icons.calendar,
+    ctx.icons.reset,
+    formatResetDate,
+    modelUsageSuffix(usage.entries),
+  )
+}
+
+export async function segSessionCost(data: Input, ctx: Ctx): Promise<string | null> {
+  const cost = getSessionCost(data, ctx.env)
+  if (cost === null) return null
+  return `${ctx.icons.money} ${await formatCost(cost, ctx)} (session)`
+}
+
+export async function segDailyCost(data: Input, ctx: Ctx): Promise<string | null> {
+  const daily = getDailyCost(data, ctx.env)
+  if (daily === null || daily <= 0) return null
+  return `${ctx.icons.money} ${await formatCost(daily, ctx)} (daily)`
+}
