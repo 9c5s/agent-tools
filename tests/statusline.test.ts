@@ -1028,11 +1028,11 @@ describe('fetchUsageSnapshot', () => {
 })
 
 describe('refreshSpawnOptions', () => {
-  test('Windows ではコンソール窓を隠すだけでデタッチしない', () => {
-    expect(sl.refreshSpawnOptions('win32')).toEqual({ windowsHide: true })
+  test('Windows ではデタッチしてコンソール窓も隠す', () => {
+    expect(sl.refreshSpawnOptions('win32')).toEqual({ detached: true, windowsHide: true })
   })
 
-  test('それ以外では新しいセッションで起動する', () => {
+  test('それ以外ではデタッチだけを指定する', () => {
     expect(sl.refreshSpawnOptions('linux')).toEqual({ detached: true })
     expect(sl.refreshSpawnOptions('darwin')).toEqual({ detached: true })
   })
