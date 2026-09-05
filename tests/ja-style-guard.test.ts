@@ -384,3 +384,12 @@ test('checkVocabulary は欠落と合流と前倒しを口語動詞として検�
   expect(checkVocabulary('既存の誘導に合流する')).toEqual([])
   expect(checkVocabulary('Task 1 を前倒しで進める')).toEqual([])
 })
+
+test('checkVocabulary は Python の定義名の内部の境界を警告しない', () => {
+  expect(checkVocabulary('def test_期限内はTrueを返す(self) -> None:')).toEqual([])
+  expect(checkVocabulary('    def test_daily_budgetが実POST試行を打ち切る(self, tmp_path: Path) -> None:')).toEqual([])
+})
+
+test('checkVocabulary は定義行でもコメントの境界は警告する', () => {
+  expect(checkVocabulary('def run(self):  # fileを返す').join('')).toContain('境界')
+})
