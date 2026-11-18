@@ -3,7 +3,7 @@
 // 入力 JSON の構造: https://code.claude.com/docs/en/statusline
 
 import { Database, SQLiteError } from 'bun:sqlite'
-import { lstatSync, mkdirSync, readFileSync, realpathSync, rmSync } from 'node:fs'
+import { lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { parseArgs as parseNodeArgs } from 'node:util'
@@ -290,47 +290,37 @@ function openStateDb(path: string): Database {
   }
 }
 
-function isCorruptDb(error: SQLiteError): boolean {
+// 破損した DB は、他のプロセスが使用中かもしれず消すと破損を広げるため、自動では作り直さない
+// 削除の手順を stderr に案内する (stdout は表示に使う)
+function reportCorruptDb(env: Env, path: string, error: unknown): void {
+  if (!(error instanceof SQLiteError)) return
   const primary = error.errno & 0xff
-  return primary === SQLITE_CORRUPT || primary === SQLITE_NOTADB
+  if (primary !== SQLITE_CORRUPT && primary !== SQLITE_NOTADB) return
+  env.stderr(
+    `statusline: 状態の DB が破損しているため使えません。${path} を削除すると、次の描画で作り直します。\n`,
+  )
 }
 
-// 壊れた DB とジャーナルを消す (他のプロセスが開いていて消せなければ false)
-function removeStateDb(path: string): boolean {
-  try {
-    rmSync(path, { force: true })
-    rmSync(`${path}-journal`, { force: true })
-    return true
-  } catch {
-    return false
-  }
-}
-
-// DB を開いて fn を実行する。壊れていれば消して一度だけ作り直す
-// 開けない、ロックを待ちきれないなどで実行できなければ null を返す
+// DB を開いて fn を実行する。開けない、ロックを待ちきれない、破損しているなどで実行できなければ null を返す
 // fn の中の SQLite 以外の例外はプログラムの誤りなので外へ出す
 function withStateDb<T>(env: Env, fn: (db: Database) => T): T | null {
   const path = statePath(env)
-  for (let attempt = 0; attempt < 2; attempt++) {
-    let db: Database
-    try {
-      db = openStateDb(path)
-    } catch (error) {
-      const corrupt = error instanceof SQLiteError && isCorruptDb(error)
-      if (attempt === 0 && corrupt && removeStateDb(path)) continue
-      return null
-    }
-    try {
-      return fn(db)
-    } catch (error) {
-      if (!(error instanceof SQLiteError)) throw error
-      if (attempt > 0 || !isCorruptDb(error)) return null
-    } finally {
-      db.close()
-    }
-    if (!removeStateDb(path)) return null
+  let db: Database
+  try {
+    db = openStateDb(path)
+  } catch (error) {
+    reportCorruptDb(env, path, error)
+    return null
   }
-  return null
+  try {
+    return fn(db)
+  } catch (error) {
+    if (!(error instanceof SQLiteError)) throw error
+    reportCorruptDb(env, path, error)
+    return null
+  } finally {
+    db.close()
+  }
 }
 
 function readStateRow(db: Database, key: StateKey): CacheObject {

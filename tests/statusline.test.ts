@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -64,6 +65,32 @@ function writeRawState(env: sl.Env, key: sl.StateKey, body: string): void {
     db.query('UPDATE state SET body = ? WHERE key = ?').run(body, key)
   } finally {
     db.close()
+  }
+}
+
+// stream から text が現れるまで読む。先に終わるか期限が来たら失敗させる
+async function readUntil(
+  stream: ReadableStream<Uint8Array>,
+  text: string,
+  timeoutMs: number,
+): Promise<void> {
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  const deadline = Date.now() + timeoutMs
+  let output = ''
+  try {
+    while (!output.includes(text)) {
+      const chunk = await Promise.race([
+        reader.read(),
+        Bun.sleep(Math.max(0, deadline - Date.now())).then(() => null),
+      ])
+      if (chunk === null)
+        throw new Error(`${timeoutMs} ms 以内に ${JSON.stringify(text)} が出力されませんでした`)
+      if (chunk.done) throw new Error(`${JSON.stringify(text)} の前に出力が終わりました`)
+      output += decoder.decode(chunk.value, { stream: true })
+    }
+  } finally {
+    reader.releaseLock()
   }
 }
 
@@ -316,14 +343,30 @@ describe('状態の DB', () => {
     expect(sl.readState(env, sl.STATE_KEYS.git)).toEqual({})
   })
 
-  test('DB でないファイルは消して作り直す', () => {
-    const env = makeEnv()
+  test('DB でないファイルは消さずに使わず、削除の手順を stderr に案内する', () => {
+    const stderr = mock((_text: string) => undefined)
+    const env = makeEnv({ stderr })
+    const content = 'not a database '.repeat(100)
     mkdirSync(dirname(sl.statePath(env)), { mode: 0o700 })
-    writeFileSync(sl.statePath(env), 'not a database '.repeat(100), 'utf8')
-    expect(sl.updateState(env, sl.STATE_KEYS.git, () => ({ value: 'ok', next: { v: 1 } }))).toBe(
-      'ok',
-    )
-    expect(sl.readState(env, sl.STATE_KEYS.git)).toEqual({ v: 1 })
+    writeFileSync(sl.statePath(env), content, 'utf8')
+    const update = mock(() => ({ value: 1, next: { v: 1 } }))
+    expect(sl.updateState(env, sl.STATE_KEYS.git, update)).toBeNull()
+    expect(update).not.toHaveBeenCalled()
+    expect(readFileSync(sl.statePath(env), 'utf8')).toBe(content)
+    expect(stderr).toHaveBeenCalledTimes(1)
+    expect(stderr.mock.calls[0]?.[0]).toContain(sl.statePath(env))
+  })
+
+  test('ロックを待ちきれないことは破損として案内しない', () => {
+    const stderr = mock((_text: string) => undefined)
+    const env = makeEnv({ stderr })
+    const release = holdStateLock(env)
+    try {
+      expect(sl.updateState(env, sl.STATE_KEYS.git, () => ({ value: 1, next: {} }))).toBeNull()
+    } finally {
+      release()
+    }
+    expect(stderr).not.toHaveBeenCalled()
   })
 
   test('DB を開けなければ null を返し、update を呼ばない', () => {
@@ -397,12 +440,18 @@ describe('状態の DB', () => {
       'Bun.sleepSync(60_000)',
     ].join('\n')
     const child = Bun.spawn([process.execPath, '-e', code], { stdout: 'pipe' })
-    await child.stdout.getReader().read()
-    child.kill('SIGKILL')
-    await child.exited
-    const started = Date.now()
-    expect(sl.updateState(env, sl.STATE_KEYS.git, (state) => ({ value: state }))).toEqual({ v: 1 })
-    expect(Date.now() - started).toBeLessThan(500)
+    try {
+      await readUntil(child.stdout, 'locked\n', 10_000)
+      child.kill('SIGKILL')
+      await child.exited
+      const started = Date.now()
+      expect(sl.updateState(env, sl.STATE_KEYS.git, (state) => ({ value: state }))).toEqual({
+        v: 1,
+      })
+      expect(Date.now() - started).toBeLessThan(500)
+    } finally {
+      child.kill('SIGKILL')
+    }
   })
 
   test('複数のプロセスが同時に日次コストを更新しても、新しいセッションの記録を失わない', async () => {
