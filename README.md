@@ -77,6 +77,7 @@ bun run lint:fix   # フォーマットと自動修正を適用
 - **Stop**：記録を消費し、記録か `last_assistant_message` に英語の文があれば `decision: block` で終了を差し止めます。
   書き直しの後（`stop_hook_active` が true の場合）も検査します。
   判定の誤りで終了できなくなるのを防ぐため、差し止めは 1 回の入力につき 2 回までです。
+  上限に達した入力では、MessageDisplay も英語の行を隠さず、応答をそのまま表示します。
 
 PreToolUse の時点では、直前のテキストがまだ transcript に書き込まれていません。
 そのため transcript は読まず、MessageDisplay の記録で判定します。
