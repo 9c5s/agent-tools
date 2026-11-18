@@ -2,19 +2,10 @@
 // statusline フックから stdin で受け取った JSON を、プロジェクト情報やレートリミットの行に整形して出力する
 // 入力 JSON の構造: https://code.claude.com/docs/en/statusline
 
-import {
-  chmodSync,
-  closeSync,
-  openSync,
-  readFileSync,
-  realpathSync,
-  renameSync,
-  statSync,
-  unlinkSync,
-  writeFileSync,
-} from 'node:fs'
+import { Database, SQLiteError } from 'bun:sqlite'
+import { readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { basename, dirname, join, resolve } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import { parseArgs as parseNodeArgs } from 'node:util'
 
 // stdin の JSON はこの型で受け取り、各セグメントが必要なフィールドの型を検査する
@@ -227,19 +218,6 @@ export const defaultEnv: Env = {
 // 表示の設定。main が引数から組み立てて各セグメントへ渡す
 export type Ctx = { icons: Icons; currency: string; env: Env }
 
-// キャッシュのファイル名は Python 版と同じにし、既存のファイルを引き継ぐ
-export const CACHE_FILES = {
-  git: 'claude-git-cache.json',
-  exchange: 'claude-exchange-cache.json',
-  sessionCost: 'claude-session-cost.json',
-  dailyCost: 'claude-daily-cost.json',
-  modelUsage: 'claude-model-usage.json',
-} as const
-
-export function cachePath(env: Env, name: (typeof CACHE_FILES)[keyof typeof CACHE_FILES]): string {
-  return join(env.tmpDir(), name)
-}
-
 // ローカル日付を YYYY-MM-DD にする
 export function today(env: Env): string {
   const date = new Date(env.now() * 1000)
@@ -247,16 +225,6 @@ export function today(env: Env): string {
 }
 
 export type CacheObject = Record<string, unknown>
-
-// キャッシュファイルを読む (無い、解析できない場合は空のオブジェクト)
-export function readCacheObject(path: string): CacheObject {
-  try {
-    const obj: unknown = JSON.parse(readFileSync(path, 'utf8'))
-    return isRecord(obj) ? obj : {}
-  } catch {
-    return {}
-  }
-}
 
 export function cacheKeyMatches(cache: CacheObject, cacheKey?: Record<string, string>): boolean {
   if (!cacheKey) return true
@@ -269,84 +237,129 @@ function cacheTime(value: unknown): number | null {
   return time !== null && Number.isFinite(time) ? time : null
 }
 
-// 一時ファイルに書いてから rename し、保存できたかを返す (書き込み途中の内容を他プロセスに読ませない)
-export function writeCache(path: string, obj: CacheObject): boolean {
-  const suffix = `${process.pid}-${Math.random().toString(36).slice(2)}`
-  const tmp = join(dirname(path), `claude-cache-${suffix}.tmp`)
-  const discard = () => {
-    try {
-      unlinkSync(tmp)
-    } catch {
-      // 一時ファイルが作れていなければ消すものも無い
-    }
-  }
+// キャッシュと、複数のプロセスが読み書きする状態は SQLite の 1 ファイルに置き、トランザクションで直列化する
+// SQLite のロックはプロセスの終了時に OS が外すため、打ち切られたプロセスのロックが残らない
+const STATE_DB_FILE = 'claude-statusline-state.sqlite'
+const STATE_BUSY_TIMEOUT_MS = 1000
+// SQLite の主エラーコード (拡張エラーコードの下位 8 ビット)
+const SQLITE_CORRUPT = 11
+const SQLITE_NOTADB = 26
+
+export const STATE_KEYS = {
+  git: 'git',
+  exchange: 'exchange',
+  sessionCost: 'session-cost',
+  dailyCost: 'daily-cost',
+  modelUsage: 'model-usage',
+} as const
+
+export type StateKey = (typeof STATE_KEYS)[keyof typeof STATE_KEYS]
+
+// value を呼び出し元へ返し、next があれば状態をそれで置き換える
+export type StateUpdate<T> = { value: T; next?: CacheObject }
+
+export function statePath(env: Env): string {
+  return join(env.tmpDir(), STATE_DB_FILE)
+}
+
+function openStateDb(path: string): Database {
+  // 共有の一時ディレクトリで他のユーザーに読まれないよう、所有者だけが読み書きできる形で先に作る
+  // (SQLite はジャーナルを DB と同じ権限で作る)
+  writeFileSync(path, '', { flag: 'a', mode: 0o600 })
+  const db = new Database(path, { create: true })
   try {
-    writeFileSync(tmp, JSON.stringify(obj), { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+    db.run(`PRAGMA busy_timeout = ${STATE_BUSY_TIMEOUT_MS}`)
+    db.run('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, body TEXT NOT NULL)')
+    return db
   } catch (error) {
-    // 名前が衝突した一時ファイルは他のプロセスのものなので消さない
-    if (!(isRecord(error) && error.code === 'EEXIST')) discard()
-    return false
-  }
-  try {
-    renameSync(tmp, path)
-  } catch {
-    discard()
-    return false
-  }
-  try {
-    chmodSync(path, 0o600)
-  } catch {
-    // 権限を変えられないファイルシステムでは無視する
-  }
-  return true
-}
-
-// これより古いロックは、取得したまま打ち切られたプロセスの残りとみなして消す
-const LOCK_STALE_MS = 5000
-
-function removeStaleLock(lockPath: string): void {
-  try {
-    if (Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS) unlinkSync(lockPath)
-  } catch {
-    // 並行するプロセスが先に消した場合は何もしない
+    db.close()
+    throw error
   }
 }
 
-// <path>.lock を排他的に作って read-modify-write を直列化する
-// timeoutMs 内に取得できなければ、可用性を優先してロック無しで実行する (fn には取得できたかを渡す)
-export function withFileLock<T>(path: string, fn: (locked: boolean) => T, timeoutMs = 1000): T {
-  const lockPath = `${path}.lock`
-  const deadline = Date.now() + timeoutMs
-  let fd: number | null = null
-  while (Date.now() < deadline) {
+function isCorruptDb(error: SQLiteError): boolean {
+  const primary = error.errno & 0xff
+  return primary === SQLITE_CORRUPT || primary === SQLITE_NOTADB
+}
+
+// 壊れた DB とジャーナルを消す (他のプロセスが開いていて消せなければ false)
+function removeStateDb(path: string): boolean {
+  try {
+    rmSync(path, { force: true })
+    rmSync(`${path}-journal`, { force: true })
+    return true
+  } catch {
+    return false
+  }
+}
+
+// DB を開いて fn を実行する。壊れていれば消して一度だけ作り直す
+// 開けない、ロックを待ちきれないなどで実行できなければ null を返す
+// fn の中の SQLite 以外の例外はプログラムの誤りなので外へ出す
+function withStateDb<T>(env: Env, fn: (db: Database) => T): T | null {
+  const path = statePath(env)
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let db: Database
     try {
-      fd = openSync(lockPath, 'wx')
-      break
-    } catch {
-      removeStaleLock(lockPath)
-      Bun.sleepSync(10)
+      db = openStateDb(path)
+    } catch (error) {
+      const corrupt = error instanceof SQLiteError && isCorruptDb(error)
+      if (attempt === 0 && corrupt && removeStateDb(path)) continue
+      return null
     }
+    try {
+      return fn(db)
+    } catch (error) {
+      if (!(error instanceof SQLiteError)) throw error
+      if (attempt > 0 || !isCorruptDb(error)) return null
+    } finally {
+      db.close()
+    }
+    if (!removeStateDb(path)) return null
   }
+  return null
+}
+
+function readStateRow(db: Database, key: StateKey): CacheObject {
+  const row = db.query<{ body: string }, [string]>('SELECT body FROM state WHERE key = ?').get(key)
+  if (row === null) return {}
   try {
-    return fn(fd !== null)
-  } finally {
-    if (fd !== null) {
-      try {
-        closeSync(fd)
-      } catch {
-        // 閉じられなくても解放は続ける
-      }
-      try {
-        unlinkSync(lockPath)
-      } catch {
-        // 既に無ければよい
-      }
-    }
+    const obj: unknown = JSON.parse(row.body)
+    return isRecord(obj) ? obj : {}
+  } catch {
+    return {}
   }
+}
+
+// key の状態を読む (無い、読めない場合は空のオブジェクト)
+export function readState(env: Env, key: StateKey): CacheObject {
+  return withStateDb(env, (db) => readStateRow(db, key)) ?? {}
+}
+
+// key の状態を BEGIN IMMEDIATE で排他して読み、update の結果に従って置き換える
+// DB を使えないときは update を呼ばずに null を返す
+export function updateState<T>(
+  env: Env,
+  key: StateKey,
+  update: (state: CacheObject) => StateUpdate<T>,
+): T | null {
+  return withStateDb(env, (db) =>
+    db
+      .transaction(() => {
+        const result = update(readStateRow(db, key))
+        if (result.next !== undefined) {
+          db.query(
+            'INSERT INTO state (key, body) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET body = excluded.body',
+          ).run(key, JSON.stringify(result.next))
+        }
+        return result.value
+      })
+      .immediate(),
+  )
 }
 
 export type CachedFetchOptions<T> = {
-  path: string
+  key: StateKey
   ttl: number // 秒
   fetch: () => Promise<T | null>
   isValid: (value: unknown) => value is T
@@ -355,9 +368,10 @@ export type CachedFetchOptions<T> = {
 
 // TTL 内かつ cacheKey が一致するキャッシュを返し、無ければ取得して保存する
 // 取得に失敗したときは期限切れのキャッシュを返す
+// 取得はトランザクションの外で行う (並行して取得した書き手どうしは、最後に書いた値が残る)
 export async function cachedFetch<T>(env: Env, options: CachedFetchOptions<T>): Promise<T | null> {
   const now = env.now()
-  const cache = readCacheObject(options.path)
+  const cache = readState(env, options.key)
   const cached = cache.data
   let expired: T | null = null
   if (cacheKeyMatches(cache, options.cacheKey) && options.isValid(cached)) {
@@ -371,7 +385,10 @@ export async function cachedFetch<T>(env: Env, options: CachedFetchOptions<T>): 
     return expired
   }
   if (data === null) return expired
-  writeCache(options.path, { ...options.cacheKey, _cached_at: now, data })
+  updateState(env, options.key, () => ({
+    value: undefined,
+    next: { ...options.cacheKey, _cached_at: now, data },
+  }))
   return data
 }
 
@@ -482,7 +499,7 @@ function isNumber(value: unknown): value is number {
 export async function getExchangeRate(currency: string, env: Env): Promise<number | null> {
   if (currency === 'USD') return null
   return cachedFetch(env, {
-    path: cachePath(env, CACHE_FILES.exchange),
+    key: STATE_KEYS.exchange,
     ttl: Number.POSITIVE_INFINITY,
     cacheKey: { currency, date: today(env) },
     isValid: isNumber,
@@ -539,7 +556,7 @@ export function fetchGitInfo(cwd: string, env: Env): GitInfo {
 // cwd をキーに 5 秒キャッシュする
 export function getGitInfo(cwd: string, env: Env): Promise<GitInfo | null> {
   return cachedFetch(env, {
-    path: cachePath(env, CACHE_FILES.git),
+    key: STATE_KEYS.git,
     ttl: GIT_CACHE_TTL,
     cacheKey: { cwd },
     isValid: isGitInfo,
@@ -574,14 +591,12 @@ export function getSessionCost(data: Input, env: Env): number | null {
   if (total === null) return null
   const sessionId = data.session_id
   if (typeof sessionId !== 'string' || sessionId === '') return total
-  const path = cachePath(env, CACHE_FILES.sessionCost)
-  return withFileLock(path, () => {
-    const sessions = readSessions(readCacheObject(path).sessions)
+  return updateState(env, STATE_KEYS.sessionCost, (state) => {
+    const sessions = readSessions(state.sessions)
     const baseline = sessions[sessionId]
-    if (baseline !== undefined) return total - baseline
+    if (baseline !== undefined) return { value: total - baseline }
     sessions[sessionId] = total
-    writeCache(path, { sessions })
-    return 0
+    return { value: 0, next: { sessions } }
   })
 }
 
@@ -592,22 +607,18 @@ export function getDailyCost(data: Input, env: Env): number | null {
   if (total === null) return null
   const sessionId = typeof data.session_id === 'string' ? data.session_id : ''
   const date = today(env)
-  const path = cachePath(env, CACHE_FILES.dailyCost)
-  return withFileLock(path, () => {
-    const cache = readCacheObject(path)
+  return updateState(env, STATE_KEYS.dailyCost, (state) => {
     let accumulated = 0
     let sessions: Record<string, number> = {}
-    if (cache.date === date) {
-      accumulated = safeFloat(cache.accumulated) ?? 0
-      sessions = readSessions(cache.sessions)
+    if (state.date === date) {
+      accumulated = safeFloat(state.accumulated) ?? 0
+      sessions = readSessions(state.sessions)
     }
     const last = sessions[sessionId]
     if (last !== undefined && total - last > 0) accumulated += total - last
-    if (last !== total) {
-      sessions[sessionId] = total
-      writeCache(path, { date, sessions, accumulated })
-    }
-    return accumulated
+    if (last === total) return { value: accumulated }
+    sessions[sessionId] = total
+    return { value: accumulated, next: { date, sessions, accumulated } }
   })
 }
 
@@ -725,17 +736,16 @@ function needsUsageRefresh(cache: CacheObject, now: number): boolean {
   return !fresh && now - (cacheTime(cache._attempted_at) ?? 0) >= MODEL_USAGE_RETRY_INTERVAL
 }
 
-// 更新を起動する権利を取る。ロックの中で読み直して判定し、試行時刻を保存できたら権利を得る
+// 更新を起動する権利を取る。トランザクションの中で読み直して判定し、試行時刻を保存できたら権利を得る
 // 子プロセスの起動前に記録し、取得中の描画や並行する描画で重複起動させない
-// ロックを取れないときは、並行する呼び出しが更新するとみなして権利を与えない
+// DB を使えないときは、権利を与えない
 export function claimUsageRefresh(env: Env, now: number): boolean {
-  const path = cachePath(env, CACHE_FILES.modelUsage)
-  return withFileLock(path, (locked) => {
-    if (!locked) return false
-    const cache = readCacheObject(path)
-    if (!needsUsageRefresh(cache, now)) return false
-    return writeCache(path, { ...cache, _attempted_at: now })
-  })
+  const claimed = updateState(env, STATE_KEYS.modelUsage, (state) =>
+    needsUsageRefresh(state, now)
+      ? { value: true, next: { ...state, _attempted_at: now } }
+      : { value: false },
+  )
+  return claimed ?? false
 }
 
 // detached を付けないと Windows では親の終了時に子も終了させられる
@@ -759,7 +769,7 @@ export function spawnUsageRefresh(env: Env): void {
 // 使用量キャッシュから週次バケットとモデル別の内訳を取る (この経路では HTTP を発行しない)
 // TTL を超えていれば古い値を返しつつ更新を起動し、STALE を超えた値は返さない
 export function getModelUsage(env: Env): ModelUsage {
-  const cache = readCacheObject(cachePath(env, CACHE_FILES.modelUsage))
+  const cache = readState(env, STATE_KEYS.modelUsage)
   const now = env.now()
   const usable = isUsageCacheUsable(cache, now)
   const entries = usable && Array.isArray(cache.data) ? cache.data.filter(isModelUsageEntry) : null
@@ -769,20 +779,15 @@ export function getModelUsage(env: Env): ModelUsage {
 }
 
 // 使用量 API を取ってキャッシュを更新する (--refresh-usage 用)
-// HTTP はロックの外で行い、失敗時は試行時刻だけ更新して既存の値を保つ
+// HTTP はトランザクションの外で行い、失敗時は試行時刻だけ更新して既存の値を保つ
 export async function refreshModelUsage(env: Env): Promise<void> {
   const snapshot = await fetchUsageSnapshot(env)
   const now = env.now()
-  const path = cachePath(env, CACHE_FILES.modelUsage)
-  withFileLock(path, () => {
-    const cache = readCacheObject(path)
-    cache._attempted_at = now
-    if (snapshot) {
-      cache._cached_at = now
-      cache.data = snapshot.model_scoped
-      cache.weekly = snapshot.weekly
-    }
-    writeCache(path, cache)
+  updateState(env, STATE_KEYS.modelUsage, (state) => {
+    const fetched = snapshot
+      ? { _cached_at: now, data: snapshot.model_scoped, weekly: snapshot.weekly }
+      : {}
+    return { value: undefined, next: { ...state, _attempted_at: now, ...fetched } }
   })
 }
 
