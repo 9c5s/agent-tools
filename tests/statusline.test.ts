@@ -1,14 +1,6 @@
-import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test'
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-  utimesSync,
-  writeFileSync,
-} from 'node:fs'
+import { Database } from 'bun:sqlite'
+import { afterEach, describe, expect, mock, test } from 'bun:test'
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as sl from '../.claude/scripts/statusline'
@@ -51,8 +43,30 @@ function writeJson(path: string, value: unknown): void {
   writeFileSync(path, JSON.stringify(value), 'utf8')
 }
 
-function readJson(path: string): Record<string, unknown> {
-  return JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
+function writeState(env: sl.Env, key: sl.StateKey, value: sl.CacheObject): void {
+  sl.updateState(env, key, () => ({ value: null, next: value }))
+}
+
+// 状態の本文をそのまま書く (JSON で表せない値や、解析できない本文を再現する)
+function writeRawState(env: sl.Env, key: sl.StateKey, body: string): void {
+  writeState(env, key, {})
+  const db = new Database(sl.statePath(env))
+  try {
+    db.query('UPDATE state SET body = ? WHERE key = ?').run(body, key)
+  } finally {
+    db.close()
+  }
+}
+
+// 別の接続で状態の DB の書き込みロックを取り、解放する関数を返す
+function holdStateLock(env: sl.Env): () => void {
+  writeState(env, sl.STATE_KEYS.git, {})
+  const db = new Database(sl.statePath(env))
+  db.run('BEGIN IMMEDIATE')
+  return () => {
+    db.run('ROLLBACK')
+    db.close()
+  }
 }
 
 describe('safeFloat', () => {
@@ -260,30 +274,6 @@ describe('today', () => {
   })
 })
 
-describe('cachePath', () => {
-  test('env.tmpDir の下にキャッシュファイルを置く', () => {
-    const env = makeEnv()
-    expect(sl.cachePath(env, sl.CACHE_FILES.git)).toBe(join(env.tmpDir(), 'claude-git-cache.json'))
-  })
-})
-
-describe('readCacheObject', () => {
-  test('JSON オブジェクトを返す', () => {
-    const path = join(makeDir(), 'c.json')
-    writeJson(path, { a: 1 })
-    expect(sl.readCacheObject(path)).toEqual({ a: 1 })
-  })
-
-  test('無い、解析できない、オブジェクトでない場合は空のオブジェクト', () => {
-    const dir = makeDir()
-    expect(sl.readCacheObject(join(dir, 'absent.json'))).toEqual({})
-    writeFileSync(join(dir, 'broken.json'), '{oops', 'utf8')
-    expect(sl.readCacheObject(join(dir, 'broken.json'))).toEqual({})
-    writeJson(join(dir, 'list.json'), [1, 2])
-    expect(sl.readCacheObject(join(dir, 'list.json'))).toEqual({})
-  })
-})
-
 describe('cacheKeyMatches', () => {
   test('キーが無ければ常に一致', () => {
     expect(sl.cacheKeyMatches({ a: 'x' })).toBe(true)
@@ -300,153 +290,166 @@ describe('cacheKeyMatches', () => {
   })
 })
 
-describe('writeCache', () => {
-  test('JSON を書き、既存のファイルを置き換える', () => {
-    const path = join(makeDir(), 'c.json')
-    sl.writeCache(path, { v: 1 })
-    sl.writeCache(path, { v: 2 })
-    expect(readJson(path)).toEqual({ v: 2 })
+describe('状態の DB', () => {
+  test('next を返したら書き戻し、返さなければ書かない', () => {
+    const env = makeEnv()
+    expect(sl.updateState(env, sl.STATE_KEYS.git, () => ({ value: 1, next: { v: 1 } }))).toBe(1)
+    expect(sl.updateState(env, sl.STATE_KEYS.git, (state) => ({ value: state.v }))).toBe(1)
+    expect(sl.readState(env, sl.STATE_KEYS.git)).toEqual({ v: 1 })
+    expect(sl.readState(env, sl.STATE_KEYS.exchange)).toEqual({})
   })
 
-  test('rename に失敗したら一時ファイルを残さない', () => {
-    const dir = makeDir()
-    // 同名のディレクトリがあると rename に失敗する
-    const target = join(dir, 'cache.json')
-    mkdirSync(target)
-    expect(sl.writeCache(target, { key: 'value' })).toBe(false)
-    expect(readdirSync(dir).filter((name) => name.startsWith('claude-cache-'))).toEqual([])
+  test('解析できない本文とオブジェクトでない本文は空の状態として扱う', () => {
+    const env = makeEnv()
+    writeRawState(env, sl.STATE_KEYS.git, '{oops')
+    expect(sl.readState(env, sl.STATE_KEYS.git)).toEqual({})
+    writeRawState(env, sl.STATE_KEYS.git, '[1,2]')
+    expect(sl.readState(env, sl.STATE_KEYS.git)).toEqual({})
   })
 
-  test('保存できたら true を返す', () => {
-    expect(sl.writeCache(join(makeDir(), 'c.json'), { v: 1 })).toBe(true)
+  test('DB でないファイルは消して作り直す', () => {
+    const env = makeEnv()
+    writeFileSync(sl.statePath(env), 'not a database '.repeat(100), 'utf8')
+    expect(sl.updateState(env, sl.STATE_KEYS.git, () => ({ value: 'ok', next: { v: 1 } }))).toBe(
+      'ok',
+    )
+    expect(sl.readState(env, sl.STATE_KEYS.git)).toEqual({ v: 1 })
   })
 
-  test('一時ファイルの名前が衝突したら書かず、既存のファイルを消さない', () => {
-    const dir = makeDir()
-    const random = spyOn(Math, 'random').mockReturnValue(0.5)
+  test('DB を開けなければ null を返し、update を呼ばない', () => {
+    const env = makeEnv()
+    mkdirSync(sl.statePath(env))
+    const update = mock(() => ({ value: 1 }))
+    expect(sl.updateState(env, sl.STATE_KEYS.git, update)).toBeNull()
+    expect(update).not.toHaveBeenCalled()
+    expect(sl.readState(env, sl.STATE_KEYS.git)).toEqual({})
+  })
+
+  test('ロックを待ちきれなければ null を返す', () => {
+    const env = makeEnv()
+    const release = holdStateLock(env)
     try {
-      const other = join(dir, `claude-cache-${process.pid}-${(0.5).toString(36).slice(2)}.tmp`)
-      writeFileSync(other, 'other', 'utf8')
-      expect(sl.writeCache(join(dir, 'c.json'), { v: 1 })).toBe(false)
-      expect(readFileSync(other, 'utf8')).toBe('other')
-      expect(existsSync(join(dir, 'c.json'))).toBe(false)
+      expect(sl.updateState(env, sl.STATE_KEYS.git, () => ({ value: 1, next: {} }))).toBeNull()
     } finally {
-      random.mockRestore()
+      release()
     }
   })
-})
 
-describe('withFileLock', () => {
-  test('ロックを作り、関数の戻り値を返し、終了時に消す', () => {
-    const path = join(makeDir(), 'cache.json')
-    const lock = `${path}.lock`
-    const result = sl.withFileLock(path, (locked) => {
-      expect(locked).toBe(true)
-      expect(existsSync(lock)).toBe(true)
-      return 42
-    })
-    expect(result).toBe(42)
-    expect(existsSync(lock)).toBe(false)
-  })
-
-  test('既存のロックがあるとタイムアウト後に実行し、そのロックは消さない', () => {
-    const path = join(makeDir(), 'cache.json')
-    const lock = `${path}.lock`
-    writeFileSync(lock, '', 'utf8')
-    const fn = mock(() => 'ran')
-    expect(sl.withFileLock(path, fn, 50)).toBe('ran')
-    expect(fn).toHaveBeenCalledTimes(1)
-    expect(fn).toHaveBeenCalledWith(false)
-    expect(existsSync(lock)).toBe(true)
-  })
-
-  test('古いロックは異常終了したプロセスの残りとみなして消し、取得してから実行する', () => {
-    const path = join(makeDir(), 'cache.json')
-    const lock = `${path}.lock`
-    writeFileSync(lock, '', 'utf8')
-    const past = new Date(Date.now() - 60_000)
-    utimesSync(lock, past, past)
-    const started = Date.now()
-    expect(sl.withFileLock(path, (locked) => locked)).toBe(true)
-    expect(Date.now() - started).toBeLessThan(500)
-    expect(existsSync(lock)).toBe(false)
-  })
-
-  test('関数が例外を投げてもロックを消す', () => {
-    const path = join(makeDir(), 'cache.json')
+  test('update の中の SQLite 以外の例外は外へ出し、ロックは残さない', () => {
+    const env = makeEnv()
     expect(() =>
-      sl.withFileLock(path, () => {
+      sl.updateState(env, sl.STATE_KEYS.git, () => {
         throw new Error('boom')
       }),
     ).toThrow('boom')
-    expect(existsSync(`${path}.lock`)).toBe(false)
+    expect(sl.updateState(env, sl.STATE_KEYS.git, () => ({ value: 1 }))).toBe(1)
+  })
+
+  test.skipIf(process.platform === 'win32')('DB は所有者だけが読み書きできる権限で作る', () => {
+    const env = makeEnv()
+    sl.updateState(env, sl.STATE_KEYS.git, () => ({ value: null, next: {} }))
+    expect(statSync(sl.statePath(env)).mode & 0o777).toBe(0o600)
+  })
+
+  test('ロックを持ったまま強制終了されたプロセスがあっても、すぐに取得でき、書きかけの変更は残らない', async () => {
+    const env = makeEnv()
+    sl.updateState(env, sl.STATE_KEYS.git, () => ({ value: null, next: { v: 1 } }))
+    const code = [
+      "const { Database } = require('bun:sqlite')",
+      `const db = new Database(${JSON.stringify(sl.statePath(env))})`,
+      "db.run('BEGIN IMMEDIATE')",
+      `db.query('UPDATE state SET body = ?').run(${JSON.stringify(JSON.stringify({ v: 2 }))})`,
+      "console.log('locked')",
+      'Bun.sleepSync(60_000)',
+    ].join('\n')
+    const child = Bun.spawn([process.execPath, '-e', code], { stdout: 'pipe' })
+    await child.stdout.getReader().read()
+    child.kill('SIGKILL')
+    await child.exited
+    const started = Date.now()
+    expect(sl.updateState(env, sl.STATE_KEYS.git, (state) => ({ value: state }))).toEqual({ v: 1 })
+    expect(Date.now() - started).toBeLessThan(500)
+  })
+
+  test('複数のプロセスが同時に日次コストを更新しても、新しいセッションの記録を失わない', async () => {
+    const env = makeEnv()
+    const script = join(import.meta.dir, '..', '.claude', 'scripts', 'statusline.ts')
+    const code = (sessionId: string) =>
+      [
+        `import(${JSON.stringify(script)}).then((sl) => {`,
+        `  const env = { ...sl.defaultEnv, tmpDir: () => ${JSON.stringify(env.tmpDir())}, now: () => ${NOW} }`,
+        '  for (const total of [0, 1]) {',
+        `    sl.getDailyCost({ cost: { total_cost_usd: total }, session_id: ${JSON.stringify(sessionId)} }, env)`,
+        '  }',
+        '})',
+      ].join('\n')
+    const children = Array.from({ length: 8 }, (_, i) =>
+      Bun.spawn([process.execPath, '-e', code(`s${i}`)], { stdout: 'ignore' }),
+    )
+    expect(await Promise.all(children.map((child) => child.exited))).toEqual(Array(8).fill(0))
+    const state = sl.readState(env, sl.STATE_KEYS.dailyCost)
+    expect(state.accumulated).toBe(8)
+    expect(Object.keys(state.sessions as Record<string, number>)).toHaveLength(8)
   })
 })
 
 describe('cachedFetch', () => {
   const isNumber = (v: unknown): v is number => typeof v === 'number'
 
-  function options(
-    path: string,
-    fetch: () => Promise<number | null>,
-    cacheKey?: Record<string, string>,
-  ) {
-    return { path, ttl: 60, fetch, isValid: isNumber, cacheKey }
+  const KEY = sl.STATE_KEYS.git
+
+  function options(fetch: () => Promise<number | null>, cacheKey?: Record<string, string>) {
+    return { key: KEY, ttl: 60, fetch, isValid: isNumber, cacheKey }
   }
 
   test('キャッシュが無ければ取得して保存する', async () => {
     const env = makeEnv()
-    const path = join(env.tmpDir(), 'c.json')
     expect(
       await sl.cachedFetch(
         env,
-        options(path, async () => 7),
+        options(async () => 7),
       ),
     ).toBe(7)
-    expect(readJson(path)).toEqual({ _cached_at: NOW, data: 7 })
+    expect(sl.readState(env, KEY)).toEqual({ _cached_at: NOW, data: 7 })
   })
 
   test('TTL 内のキャッシュを返し取得しない', async () => {
     const env = makeEnv()
-    const path = join(env.tmpDir(), 'c.json')
-    writeJson(path, { _cached_at: NOW - 10, data: 5 })
+    writeState(env, KEY, { _cached_at: NOW - 10, data: 5 })
     const fetch = mock(async () => 9)
-    expect(await sl.cachedFetch(env, options(path, fetch))).toBe(5)
+    expect(await sl.cachedFetch(env, options(fetch))).toBe(5)
     expect(fetch).not.toHaveBeenCalled()
   })
 
   test('有限でない取得時刻は記録が無いとみなして取得し直す', async () => {
     const env = makeEnv()
-    const path = join(env.tmpDir(), 'c.json')
-    writeFileSync(path, '{"_cached_at":1e400,"data":5}', 'utf8')
+    writeRawState(env, KEY, '{"_cached_at":1e400,"data":5}')
     expect(
       await sl.cachedFetch(
         env,
-        options(path, async () => 9),
+        options(async () => 9),
       ),
     ).toBe(9)
   })
 
   test('TTL 切れなら取得し直す', async () => {
     const env = makeEnv()
-    const path = join(env.tmpDir(), 'c.json')
-    writeJson(path, { _cached_at: NOW - 120, data: 5 })
+    writeState(env, KEY, { _cached_at: NOW - 120, data: 5 })
     expect(
       await sl.cachedFetch(
         env,
-        options(path, async () => 9),
+        options(async () => 9),
       ),
     ).toBe(9)
   })
 
   test('取得に失敗したら期限切れのキャッシュを返す', async () => {
     const env = makeEnv()
-    const path = join(env.tmpDir(), 'c.json')
-    writeJson(path, { _cached_at: NOW - 120, data: 5 })
+    writeState(env, KEY, { _cached_at: NOW - 120, data: 5 })
     const failing = async (): Promise<number | null> => {
       throw new Error('fail')
     }
-    expect(await sl.cachedFetch(env, options(path, failing))).toBe(5)
+    expect(await sl.cachedFetch(env, options(failing))).toBe(5)
   })
 
   test('取得に失敗しキャッシュも無ければ null', async () => {
@@ -454,51 +457,47 @@ describe('cachedFetch', () => {
     const failing = async (): Promise<number | null> => {
       throw new Error('fail')
     }
-    expect(await sl.cachedFetch(env, options(join(env.tmpDir(), 'c.json'), failing))).toBeNull()
+    expect(await sl.cachedFetch(env, options(failing))).toBeNull()
   })
 
   test('取得が null を返したら期限切れのキャッシュを返す', async () => {
     const env = makeEnv()
-    const path = join(env.tmpDir(), 'c.json')
-    writeJson(path, { _cached_at: NOW - 120, data: 5 })
+    writeState(env, KEY, { _cached_at: NOW - 120, data: 5 })
     expect(
       await sl.cachedFetch(
         env,
-        options(path, async () => null),
+        options(async () => null),
       ),
     ).toBe(5)
   })
 
   test('cacheKey が一致しなければ取得し直す', async () => {
     const env = makeEnv()
-    const path = join(env.tmpDir(), 'c.json')
-    writeJson(path, { _cached_at: NOW, data: 5, k: 'old' })
+    writeState(env, KEY, { _cached_at: NOW, data: 5, k: 'old' })
     expect(
       await sl.cachedFetch(
         env,
-        options(path, async () => 9, { k: 'new' }),
+        options(async () => 9, { k: 'new' }),
       ),
     ).toBe(9)
-    expect(readJson(path)).toEqual({ k: 'new', _cached_at: NOW, data: 9 })
+    expect(sl.readState(env, KEY)).toEqual({ k: 'new', _cached_at: NOW, data: 9 })
   })
 
   test('cacheKey が一致すればキャッシュを返す', async () => {
     const env = makeEnv()
-    const path = join(env.tmpDir(), 'c.json')
-    writeJson(path, { _cached_at: NOW, data: 5, k: 'same' })
+    writeState(env, KEY, { _cached_at: NOW, data: 5, k: 'same' })
     const fetch = mock(async () => 9)
-    expect(await sl.cachedFetch(env, options(path, fetch, { k: 'same' }))).toBe(5)
+    expect(await sl.cachedFetch(env, options(fetch, { k: 'same' }))).toBe(5)
     expect(fetch).not.toHaveBeenCalled()
   })
 
   test('検証に通らないキャッシュは無いものとして扱う', async () => {
     const env = makeEnv()
-    const path = join(env.tmpDir(), 'c.json')
-    writeJson(path, { _cached_at: NOW, data: 'not a number' })
+    writeState(env, KEY, { _cached_at: NOW, data: 'not a number' })
     expect(
       await sl.cachedFetch(
         env,
-        options(path, async () => 9),
+        options(async () => 9),
       ),
     ).toBe(9)
   })
@@ -586,7 +585,7 @@ describe('getExchangeRate', () => {
     expect(await sl.getExchangeRate('JPY', env)).toBe(150.5)
     const url = String(fetch.mock.calls[0]?.[0])
     expect(url).toBe('https://api.frankfurter.app/latest?from=USD&to=JPY')
-    expect(readJson(sl.cachePath(env, sl.CACHE_FILES.exchange))).toEqual({
+    expect(sl.readState(env, sl.STATE_KEYS.exchange)).toEqual({
       currency: 'JPY',
       date: sl.today(env),
       _cached_at: NOW,
@@ -597,7 +596,7 @@ describe('getExchangeRate', () => {
   test('同じ日の同じ通貨のキャッシュがあれば API を呼ばない', async () => {
     const fetch = mock(async () => jsonResponse({ rates: { JPY: 1 } }))
     const env = makeEnv({ fetch })
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.exchange), {
+    writeState(env, sl.STATE_KEYS.exchange, {
       _cached_at: NOW - 86_400 * 30,
       data: 149,
       currency: 'JPY',
@@ -612,7 +611,7 @@ describe('getExchangeRate', () => {
       throw new Error('offline')
     })
     const env = makeEnv({ fetch })
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.exchange), {
+    writeState(env, sl.STATE_KEYS.exchange, {
       _cached_at: 0,
       data: 148,
       currency: 'JPY',
@@ -638,7 +637,7 @@ describe('getExchangeRate', () => {
 
   test('通貨が違うキャッシュは無視して取り直す', async () => {
     const env = makeEnv({ fetch: async () => jsonResponse({ rates: { JPY: 150 } }) })
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.exchange), {
+    writeState(env, sl.STATE_KEYS.exchange, {
       _cached_at: NOW,
       data: 0.92,
       currency: 'EUR',
@@ -651,7 +650,7 @@ describe('getExchangeRate', () => {
 describe('formatCost', () => {
   function ctxWithRate(currency: string, rate: number): sl.Ctx {
     const env = makeEnv()
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.exchange), {
+    writeState(env, sl.STATE_KEYS.exchange, {
       _cached_at: NOW,
       data: rate,
       currency,
@@ -750,7 +749,7 @@ describe('getGitInfo', () => {
     const git = fakeGit({ 'rev-parse --abbrev-ref HEAD': { exitCode: 0, stdout: 'main\n' } })
     const env = makeEnv({ spawnSync: git.spawnSync })
     expect(await sl.getGitInfo('/some/path', env)).toEqual({ branch: 'main' })
-    expect(readJson(sl.cachePath(env, sl.CACHE_FILES.git))).toEqual({
+    expect(sl.readState(env, sl.STATE_KEYS.git)).toEqual({
       cwd: '/some/path',
       _cached_at: NOW,
       data: { branch: 'main' },
@@ -760,7 +759,7 @@ describe('getGitInfo', () => {
   test('有効なキャッシュがあれば git を実行しない', async () => {
     const git = fakeGit({})
     const env = makeEnv({ spawnSync: git.spawnSync })
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.git), {
+    writeState(env, sl.STATE_KEYS.git, {
       _cached_at: NOW,
       data: { branch: 'cached-branch' },
       cwd: '/some/path',
@@ -772,7 +771,7 @@ describe('getGitInfo', () => {
   test('cwd が違えばキャッシュを無効にして取り直す', async () => {
     const git = fakeGit({ 'rev-parse --abbrev-ref HEAD': { exitCode: 0, stdout: 'new-branch\n' } })
     const env = makeEnv({ spawnSync: git.spawnSync })
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.git), {
+    writeState(env, sl.STATE_KEYS.git, {
       _cached_at: NOW,
       data: { branch: 'old-branch' },
       cwd: '/old/path',
@@ -806,29 +805,29 @@ describe('getSessionCost', () => {
   test('新しいセッションは基準値を記録して 0 を返す', () => {
     const env = makeEnv()
     expect(sl.getSessionCost(costData(2.5, 's1'), env)).toBe(0)
-    expect(readJson(sl.cachePath(env, sl.CACHE_FILES.sessionCost))).toEqual({
+    expect(sl.readState(env, sl.STATE_KEYS.sessionCost)).toEqual({
       sessions: { s1: 2.5 },
     })
   })
 
   test('既知のセッションは基準値との差分を返す', () => {
     const env = makeEnv()
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.sessionCost), { sessions: { s1: 2.5 } })
+    writeState(env, sl.STATE_KEYS.sessionCost, { sessions: { s1: 2.5 } })
     expect(sl.getSessionCost(costData(4, 's1'), env)).toBeCloseTo(1.5)
   })
 
   test('別のセッションの基準値を保つ', () => {
     const env = makeEnv()
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.sessionCost), { sessions: { s1: 2.5 } })
+    writeState(env, sl.STATE_KEYS.sessionCost, { sessions: { s1: 2.5 } })
     sl.getSessionCost(costData(1, 's2'), env)
-    expect(readJson(sl.cachePath(env, sl.CACHE_FILES.sessionCost))).toEqual({
+    expect(sl.readState(env, sl.STATE_KEYS.sessionCost)).toEqual({
       sessions: { s1: 2.5, s2: 1 },
     })
   })
 
   test('解析できないキャッシュは空として扱う', () => {
     const env = makeEnv()
-    writeFileSync(sl.cachePath(env, sl.CACHE_FILES.sessionCost), '{broken', 'utf8')
+    writeRawState(env, sl.STATE_KEYS.sessionCost, '{broken')
     expect(sl.getSessionCost(costData(3, 's1'), env)).toBe(0)
   })
 })
@@ -842,7 +841,7 @@ describe('getDailyCost', () => {
   test('初回はセッションを記録して 0 を返す', () => {
     const env = makeEnv()
     expect(sl.getDailyCost(dailyData(0), env)).toBe(0)
-    expect(readJson(sl.cachePath(env, sl.CACHE_FILES.dailyCost))).toEqual({
+    expect(sl.readState(env, sl.STATE_KEYS.dailyCost)).toEqual({
       date: sl.today(env),
       sessions: { 'sess-a': 0 },
       accumulated: 0,
@@ -851,7 +850,7 @@ describe('getDailyCost', () => {
 
   test('同じセッションの増分を累積する', () => {
     const env = makeEnv()
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.dailyCost), {
+    writeState(env, sl.STATE_KEYS.dailyCost, {
       date: sl.today(env),
       sessions: { 'sess-a': 2 },
       accumulated: 3,
@@ -861,25 +860,25 @@ describe('getDailyCost', () => {
 
   test('新しいセッションは記録だけして累積しない', () => {
     const env = makeEnv()
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.dailyCost), {
+    writeState(env, sl.STATE_KEYS.dailyCost, {
       date: sl.today(env),
       sessions: { 'sess-a': 10 },
       accumulated: 15,
     })
     expect(sl.getDailyCost(dailyData(0.5, 'sess-b'), env)).toBeCloseTo(15)
-    const cache = readJson(sl.cachePath(env, sl.CACHE_FILES.dailyCost))
+    const cache = sl.readState(env, sl.STATE_KEYS.dailyCost)
     expect(cache.sessions).toEqual({ 'sess-a': 10, 'sess-b': 0.5 })
   })
 
   test('日付が変わるとセッションの追跡と累積をリセットする', () => {
     const env = makeEnv()
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.dailyCost), {
+    writeState(env, sl.STATE_KEYS.dailyCost, {
       date: '1999-01-01',
       sessions: { 'old-sess': 50 },
       accumulated: 100,
     })
     expect(sl.getDailyCost(dailyData(2), env)).toBe(0)
-    const cache = readJson(sl.cachePath(env, sl.CACHE_FILES.dailyCost))
+    const cache = sl.readState(env, sl.STATE_KEYS.dailyCost)
     expect(cache.date).toBe(sl.today(env))
     expect(cache.sessions).toEqual({ 'sess-a': 2 })
   })
@@ -893,7 +892,7 @@ describe('getDailyCost', () => {
 
   test('解析できないキャッシュは空として扱う', () => {
     const env = makeEnv()
-    writeFileSync(sl.cachePath(env, sl.CACHE_FILES.dailyCost), '{broken', 'utf8')
+    writeRawState(env, sl.STATE_KEYS.dailyCost, '{broken')
     expect(sl.getDailyCost(dailyData(1), env)).toBe(0)
   })
 
@@ -1116,7 +1115,7 @@ describe('spawnUsageRefresh', () => {
 
 describe('getModelUsage', () => {
   function writeUsageCache(env: sl.Env, cachedAt: number, attemptedAt: number): void {
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage), {
+    writeState(env, sl.STATE_KEYS.modelUsage, {
       _cached_at: cachedAt,
       _attempted_at: attemptedAt,
       data: [ENTRY],
@@ -1153,7 +1152,7 @@ describe('getModelUsage', () => {
     sl.getModelUsage(env)
     sl.getModelUsage(env)
     expect(spawn).toHaveBeenCalledTimes(1)
-    expect(readJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage))._attempted_at).toBe(NOW)
+    expect(sl.readState(env, sl.STATE_KEYS.modelUsage)._attempted_at).toBe(NOW)
   })
 
   test('更新の権利はロックの中で読み直して判定し、先に権利を得た呼び出しがあれば与えない', () => {
@@ -1161,14 +1160,14 @@ describe('getModelUsage', () => {
     writeUsageCache(env, NOW - 600, NOW - 600)
     expect(sl.claimUsageRefresh(env, NOW)).toBe(true)
     expect(sl.claimUsageRefresh(env, NOW)).toBe(false)
-    expect(readJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage))._attempted_at).toBe(NOW)
+    expect(sl.readState(env, sl.STATE_KEYS.modelUsage)._attempted_at).toBe(NOW)
   })
 
   test('試行時刻を保存できないときは更新を起動しない', () => {
     const spawn = mock(() => undefined)
     const env = makeEnv({ spawn })
     // 同名のディレクトリがあるとキャッシュを保存できない
-    mkdirSync(sl.cachePath(env, sl.CACHE_FILES.modelUsage))
+    mkdirSync(sl.statePath(env))
     sl.getModelUsage(env)
     expect(spawn).not.toHaveBeenCalled()
   })
@@ -1176,10 +1175,10 @@ describe('getModelUsage', () => {
   test('有限でない時刻は記録が無いとみなし、値を返さずに更新を起動する', () => {
     const spawn = mock(() => undefined)
     const env = makeEnv({ spawn })
-    writeFileSync(
-      sl.cachePath(env, sl.CACHE_FILES.modelUsage),
+    writeRawState(
+      env,
+      sl.STATE_KEYS.modelUsage,
       `{"_cached_at":1e400,"_attempted_at":1e400,"data":[${JSON.stringify(ENTRY)}]}`,
-      'utf8',
     )
     expect(sl.getModelUsage(env)).toEqual({ entries: null, weekly: null })
     expect(spawn).toHaveBeenCalledTimes(1)
@@ -1189,8 +1188,12 @@ describe('getModelUsage', () => {
     const spawn = mock(() => undefined)
     const env = makeEnv({ spawn })
     writeUsageCache(env, NOW - 600, NOW - 600)
-    writeFileSync(`${sl.cachePath(env, sl.CACHE_FILES.modelUsage)}.lock`, '', 'utf8')
-    sl.getModelUsage(env)
+    const release = holdStateLock(env)
+    try {
+      sl.getModelUsage(env)
+    } finally {
+      release()
+    }
     expect(spawn).not.toHaveBeenCalled()
   })
 
@@ -1216,7 +1219,7 @@ describe('getModelUsage', () => {
 
   test('形の合わない weekly は null にする', () => {
     const env = makeEnv()
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage), {
+    writeState(env, sl.STATE_KEYS.modelUsage, {
       _cached_at: NOW,
       _attempted_at: NOW,
       data: [ENTRY],
@@ -1231,7 +1234,7 @@ describe('refreshModelUsage', () => {
     const env = makeEnv({ fetch: async () => jsonResponse(USAGE_API_SAMPLE) })
     writeCredentials(env)
     await sl.refreshModelUsage(env)
-    const cache = readJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage))
+    const cache = sl.readState(env, sl.STATE_KEYS.modelUsage)
     expect(cache.data).toEqual([
       { display_name: 'Fable', percent: 87, resets_at: WEEKLY_RESETS_AT },
     ])
@@ -1242,14 +1245,14 @@ describe('refreshModelUsage', () => {
 
   test('取得に失敗したら既存の値を保ち試行時刻だけ更新する', async () => {
     const env = makeEnv()
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage), {
+    writeState(env, sl.STATE_KEYS.modelUsage, {
       _cached_at: 100,
       _attempted_at: 100,
       data: [ENTRY],
       weekly: WEEKLY,
     })
     await sl.refreshModelUsage(env)
-    const cache = readJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage))
+    const cache = sl.readState(env, sl.STATE_KEYS.modelUsage)
     expect(cache.data).toEqual([ENTRY])
     expect(cache.weekly).toEqual(WEEKLY)
     expect(cache._cached_at).toBe(100)
@@ -1376,7 +1379,7 @@ describe('segBranch', () => {
   test('キャッシュがあれば git を実行しない', async () => {
     const git = fakeGit({})
     const env = makeEnv({ spawnSync: git.spawnSync })
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.git), {
+    writeState(env, sl.STATE_KEYS.git, {
       _cached_at: NOW,
       data: { branch: 'cached' },
       cwd: '/p',
@@ -1570,7 +1573,7 @@ describe('segRate5h', () => {
 
   test('モデル別の内訳は付けない', () => {
     const env = makeEnv()
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage), {
+    writeState(env, sl.STATE_KEYS.modelUsage, {
       _cached_at: NOW,
       _attempted_at: NOW,
       data: [{ display_name: 'Fable', percent: 88, resets_at: null }],
@@ -1587,7 +1590,7 @@ describe('segRate7d', () => {
   function envWithUsage(entries: sl.ModelUsageEntry[] | null, weekly?: sl.RateBucket): sl.Env {
     const env = makeEnv()
     if (entries !== null || weekly !== undefined) {
-      writeJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage), {
+      writeState(env, sl.STATE_KEYS.modelUsage, {
         _cached_at: NOW,
         _attempted_at: NOW,
         data: entries ?? [],
@@ -1636,7 +1639,7 @@ describe('segRate7d', () => {
 
   test('キャッシュが STALE を超えていれば stdin の値を使う', () => {
     const env = makeEnv()
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage), {
+    writeState(env, sl.STATE_KEYS.modelUsage, {
       _cached_at: NOW - 10_000,
       _attempted_at: NOW,
       data: [{ display_name: 'Fable', percent: 88, resets_at: null }],
@@ -1665,7 +1668,7 @@ describe('segRate7d', () => {
 describe('segSessionCost', () => {
   test('セッションコストを通貨で表示する', async () => {
     const env = makeEnv()
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.sessionCost), { sessions: { s1: 0 } })
+    writeState(env, sl.STATE_KEYS.sessionCost, { sessions: { s1: 0 } })
     const data = { cost: { total_cost_usd: 1.23 }, session_id: 's1' }
     expect(await sl.segSessionCost(data, makeCtx({ env }))).toBe(
       `${sl.ICONS_EMOJI.money} $1.23 (session)`,
@@ -1674,7 +1677,7 @@ describe('segSessionCost', () => {
 
   test('JPY なら ¥ で表示する', async () => {
     const env = makeEnv()
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.exchange), {
+    writeState(env, sl.STATE_KEYS.exchange, {
       _cached_at: NOW,
       data: 150,
       currency: 'JPY',
@@ -1694,7 +1697,7 @@ describe('segSessionCost', () => {
 describe('segDailyCost', () => {
   test('日次コストを通貨で表示する', async () => {
     const env = makeEnv()
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.dailyCost), {
+    writeState(env, sl.STATE_KEYS.dailyCost, {
       date: sl.today(env),
       sessions: { s1: 1 },
       accumulated: 2,
@@ -1714,13 +1717,13 @@ describe('segDailyCost', () => {
 
   test('JPY なら ¥ で表示する', async () => {
     const env = makeEnv()
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.exchange), {
+    writeState(env, sl.STATE_KEYS.exchange, {
       _cached_at: NOW,
       data: 150,
       currency: 'JPY',
       date: sl.today(env),
     })
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.dailyCost), {
+    writeState(env, sl.STATE_KEYS.dailyCost, {
       date: sl.today(env),
       sessions: { s1: 0 },
       accumulated: 0,
@@ -1876,7 +1879,7 @@ describe('buildLines', () => {
 
   test('実際の stdin の構造で 3 行を組み立てる', async () => {
     const env = makeEnv()
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.sessionCost), { sessions: { 'abc123...': 0 } })
+    writeState(env, sl.STATE_KEYS.sessionCost, { sessions: { 'abc123...': 0 } })
     const lines = await sl.buildLines(FULL_STDIN_SAMPLE, makeCtx({ env }))
     expect(lines).toHaveLength(3)
     expect(lines[0]).toContain('myproject')
@@ -1937,7 +1940,7 @@ describe('main', () => {
 
   test('--currency を通貨の決定に使う', async () => {
     const env = makeEnv()
-    writeJson(sl.cachePath(env, sl.CACHE_FILES.exchange), {
+    writeState(env, sl.STATE_KEYS.exchange, {
       _cached_at: NOW,
       data: 150,
       currency: 'JPY',
@@ -1972,6 +1975,6 @@ describe('main', () => {
     writeCredentials(env)
     expect(await sl.main(['--refresh-usage'], readStdin, env)).toEqual([])
     expect(readStdin).not.toHaveBeenCalled()
-    expect(readJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage))._cached_at).toBe(NOW)
+    expect(sl.readState(env, sl.STATE_KEYS.modelUsage)._cached_at).toBe(NOW)
   })
 })
