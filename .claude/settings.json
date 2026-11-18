@@ -81,6 +81,22 @@
           {
             "type": "command",
             "command": "uv run ~/.claude/hooks/notify.py"
+          },
+          {
+            "type": "command",
+            "command": "bun ~/.claude/hooks/ja-style-guard.ts",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "MessageDisplay": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun ~/.claude/hooks/ja-style-guard.ts",
+            "timeout": 5
           }
         ]
       }
