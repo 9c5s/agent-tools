@@ -263,26 +263,42 @@ export function cacheKeyMatches(cache: CacheObject, cacheKey?: Record<string, st
   return Object.entries(cacheKey).every(([key, value]) => cache[key] === value)
 }
 
-// 一時ファイルに書いてから rename する (書き込み途中の内容を他プロセスに読ませない)
-export function writeCache(path: string, obj: CacheObject): void {
+// キャッシュに記録した epoch 秒を返す。有限の数でなければ記録が無いとみなす
+function cacheTime(value: unknown): number | null {
+  const time = safeFloat(value)
+  return time !== null && Number.isFinite(time) ? time : null
+}
+
+// 一時ファイルに書いてから rename し、保存できたかを返す (書き込み途中の内容を他プロセスに読ませない)
+export function writeCache(path: string, obj: CacheObject): boolean {
   const suffix = `${process.pid}-${Math.random().toString(36).slice(2)}`
   const tmp = join(dirname(path), `claude-cache-${suffix}.tmp`)
-  try {
-    writeFileSync(tmp, JSON.stringify(obj), { encoding: 'utf8', mode: 0o600, flag: 'wx' })
-    renameSync(tmp, path)
-  } catch {
+  const discard = () => {
     try {
       unlinkSync(tmp)
     } catch {
       // 一時ファイルが作れていなければ消すものも無い
     }
-    return
+  }
+  try {
+    writeFileSync(tmp, JSON.stringify(obj), { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+  } catch (error) {
+    // 名前が衝突した一時ファイルは他のプロセスのものなので消さない
+    if (!(isRecord(error) && error.code === 'EEXIST')) discard()
+    return false
+  }
+  try {
+    renameSync(tmp, path)
+  } catch {
+    discard()
+    return false
   }
   try {
     chmodSync(path, 0o600)
   } catch {
     // 権限を変えられないファイルシステムでは無視する
   }
+  return true
 }
 
 // これより古いロックは、取得したまま打ち切られたプロセスの残りとみなして消す
@@ -346,7 +362,7 @@ export async function cachedFetch<T>(env: Env, options: CachedFetchOptions<T>): 
   let expired: T | null = null
   if (cacheKeyMatches(cache, options.cacheKey) && options.isValid(cached)) {
     expired = cached
-    if (now - (safeFloat(cache._cached_at) ?? 0) < options.ttl) return cached
+    if (now - (cacheTime(cache._cached_at) ?? 0) < options.ttl) return cached
   }
   let data: T | null
   try {
@@ -696,7 +712,7 @@ export async function fetchUsageSnapshot(env: Env): Promise<UsageSnapshot | null
 
 // 最後に取得できてから STALE 以内のキャッシュか
 export function isUsageCacheUsable(cache: CacheObject, now: number): boolean {
-  const cachedAt = safeFloat(cache._cached_at)
+  const cachedAt = cacheTime(cache._cached_at)
   return cachedAt !== null && now - cachedAt < MODEL_USAGE_STALE
 }
 
@@ -705,11 +721,11 @@ function needsUsageRefresh(cache: CacheObject, now: number): boolean {
   const fresh =
     isUsageCacheUsable(cache, now) &&
     Array.isArray(cache.data) &&
-    now - (safeFloat(cache._cached_at) ?? 0) < MODEL_USAGE_TTL
-  return !fresh && now - (safeFloat(cache._attempted_at) ?? 0) >= MODEL_USAGE_RETRY_INTERVAL
+    now - (cacheTime(cache._cached_at) ?? 0) < MODEL_USAGE_TTL
+  return !fresh && now - (cacheTime(cache._attempted_at) ?? 0) >= MODEL_USAGE_RETRY_INTERVAL
 }
 
-// 更新を起動する権利を取る。ロックの中で読み直して判定し、取れたら試行時刻を記録する
+// 更新を起動する権利を取る。ロックの中で読み直して判定し、試行時刻を保存できたら権利を得る
 // 子プロセスの起動前に記録し、取得中の描画や並行する描画で重複起動させない
 // ロックを取れないときは、並行する呼び出しが更新するとみなして権利を与えない
 export function claimUsageRefresh(env: Env, now: number): boolean {
@@ -718,8 +734,7 @@ export function claimUsageRefresh(env: Env, now: number): boolean {
     if (!locked) return false
     const cache = readCacheObject(path)
     if (!needsUsageRefresh(cache, now)) return false
-    writeCache(path, { ...cache, _attempted_at: now })
-    return true
+    return writeCache(path, { ...cache, _attempted_at: now })
   })
 }
 

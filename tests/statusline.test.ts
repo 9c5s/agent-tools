@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test'
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import {
   existsSync,
   mkdirSync,
@@ -313,8 +313,26 @@ describe('writeCache', () => {
     // 同名のディレクトリがあると rename に失敗する
     const target = join(dir, 'cache.json')
     mkdirSync(target)
-    sl.writeCache(target, { key: 'value' })
+    expect(sl.writeCache(target, { key: 'value' })).toBe(false)
     expect(readdirSync(dir).filter((name) => name.startsWith('claude-cache-'))).toEqual([])
+  })
+
+  test('保存できたら true を返す', () => {
+    expect(sl.writeCache(join(makeDir(), 'c.json'), { v: 1 })).toBe(true)
+  })
+
+  test('一時ファイルの名前が衝突したら書かず、既存のファイルを消さない', () => {
+    const dir = makeDir()
+    const random = spyOn(Math, 'random').mockReturnValue(0.5)
+    try {
+      const other = join(dir, `claude-cache-${process.pid}-${(0.5).toString(36).slice(2)}.tmp`)
+      writeFileSync(other, 'other', 'utf8')
+      expect(sl.writeCache(join(dir, 'c.json'), { v: 1 })).toBe(false)
+      expect(readFileSync(other, 'utf8')).toBe('other')
+      expect(existsSync(join(dir, 'c.json'))).toBe(false)
+    } finally {
+      random.mockRestore()
+    }
   })
 })
 
@@ -395,6 +413,18 @@ describe('cachedFetch', () => {
     const fetch = mock(async () => 9)
     expect(await sl.cachedFetch(env, options(path, fetch))).toBe(5)
     expect(fetch).not.toHaveBeenCalled()
+  })
+
+  test('有限でない取得時刻は記録が無いとみなして取得し直す', async () => {
+    const env = makeEnv()
+    const path = join(env.tmpDir(), 'c.json')
+    writeFileSync(path, '{"_cached_at":1e400,"data":5}', 'utf8')
+    expect(
+      await sl.cachedFetch(
+        env,
+        options(path, async () => 9),
+      ),
+    ).toBe(9)
   })
 
   test('TTL 切れなら取得し直す', async () => {
@@ -1132,6 +1162,27 @@ describe('getModelUsage', () => {
     expect(sl.claimUsageRefresh(env, NOW)).toBe(true)
     expect(sl.claimUsageRefresh(env, NOW)).toBe(false)
     expect(readJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage))._attempted_at).toBe(NOW)
+  })
+
+  test('試行時刻を保存できないときは更新を起動しない', () => {
+    const spawn = mock(() => undefined)
+    const env = makeEnv({ spawn })
+    // 同名のディレクトリがあるとキャッシュを保存できない
+    mkdirSync(sl.cachePath(env, sl.CACHE_FILES.modelUsage))
+    sl.getModelUsage(env)
+    expect(spawn).not.toHaveBeenCalled()
+  })
+
+  test('有限でない時刻は記録が無いとみなし、値を返さずに更新を起動する', () => {
+    const spawn = mock(() => undefined)
+    const env = makeEnv({ spawn })
+    writeFileSync(
+      sl.cachePath(env, sl.CACHE_FILES.modelUsage),
+      `{"_cached_at":1e400,"_attempted_at":1e400,"data":[${JSON.stringify(ENTRY)}]}`,
+      'utf8',
+    )
+    expect(sl.getModelUsage(env)).toEqual({ entries: null, weekly: null })
+    expect(spawn).toHaveBeenCalledTimes(1)
   })
 
   test('ロックを取れないときは更新を起動しない', () => {
