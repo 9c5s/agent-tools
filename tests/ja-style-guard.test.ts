@@ -774,6 +774,26 @@ test('inspectStop は書き直しも英語なら差し止め 1 回の入力で 2
   })
 })
 
+test('inspectDisplay は Stop の差し止めが上限に達した入力の応答を隠さずに表示する', () => {
+  withStateDir((dir) => {
+    const english = { ...turn, last_assistant_message: 'Let me check the tests.' }
+    inspectStop(english, dir)
+    inspectStop({ ...english, stop_hook_active: true }, dir)
+    expect(hideLetMeCheck(dir)).toBeNull()
+    expect(consumeHidden(dir, turn)).toBe(0)
+    expect(inspectStop({ ...english, stop_hook_active: true }, dir)).toBeNull()
+    // 次の入力では再び隠す
+    expect(hideLetMeCheck(dir, { ...turn, prompt_id: 'p-2' })).toBe('')
+  })
+})
+
+test('inspectDisplay は書き直しを求める記録を残せない不正な prompt_id の応答を隠さない', () => {
+  withStateDir((dir) => {
+    const display = { message_id: 'm-1', index: 0, delta: 'Let me check.\n' }
+    expect(inspectDisplay({ ...display, session_id: 's-1', prompt_id: '../p' }, dir)).toBeNull()
+  })
+})
+
 test('displayPayload は表示の置き換えを MessageDisplay の出力として組み立てる', () => {
   expect(JSON.parse(displayPayload(''))).toEqual({
     hookSpecificOutput: { hookEventName: 'MessageDisplay', displayContent: '' },

@@ -512,6 +512,20 @@ export function inspectReply(payload: Entry, dir = STATE_DIR): string | null {
 // 1 回の入力で Stop が書き直しを求める回数の上限 (判定の誤りで終了できなくなるのを防ぐ)
 const MAX_STOP_BLOCKS = 2
 
+// 1 回の入力で Stop が書き直しを求めた回数の記録ファイル
+function stopsPath(dir: string, key: string): string {
+  return join(dir, `${key}.stops`)
+}
+
+// 1 回の入力で Stop が書き直しを求めた回数を返す (記録が無ければ 0)
+function stopCount(dir: string, key: string): number {
+  try {
+    return Number.parseInt(readFileSync(stopsPath(dir, key), 'utf8'), 10) || 0
+  } catch {
+    return 0
+  }
+}
+
 // Stop hook の payload を検査して 応答の終了を差し止める理由を返す (許可なら null)
 // 書き直しの後 (stop_hook_active) も検査し 差し止めは 1 回の入力で MAX_STOP_BLOCKS 回までに限る
 export function inspectStop(payload: Entry, dir = STATE_DIR): string | null {
@@ -526,16 +540,10 @@ export function inspectStop(payload: Entry, dir = STATE_DIR): string | null {
   if (reason === null || key === null) {
     return payload.stop_hook_active === true ? null : reason
   }
-  const path = join(dir, `${key}.stops`)
-  let count = 0
-  try {
-    count = Number.parseInt(readFileSync(path, 'utf8'), 10) || 0
-  } catch {
-    // 記録が無ければ最初の差し止めとして扱う
-  }
+  const count = stopCount(dir, key)
   if (count >= MAX_STOP_BLOCKS) return null
   mkdirSync(dir, { recursive: true, mode: 0o700 })
-  writeFileSync(path, String(count + 1), { mode: 0o600 })
+  writeFileSync(stopsPath(dir, key), String(count + 1), { mode: 0o600 })
   return reason
 }
 
@@ -579,8 +587,10 @@ export function inspectDisplay(payload: Entry, dir = STATE_DIR, waitMs = 1000): 
   const { message_id: id, index, delta } = payload
   if (typeof id !== 'string' || !ID_RE.test(id)) return null
   if (typeof index !== 'number' || typeof delta !== 'string') return null
-  const session = sessionOf(payload)
   const key = recordKey(payload)
+  // 書き直しを求められない応答は 隠すと利用者に届かないため元のまま表示する
+  if (key === null || stopCount(dir, key) >= MAX_STOP_BLOCKS) return null
+  const session = sessionOf(payload)
   const messageDir = join(dir, id)
   mkdirSync(messageDir, { recursive: true, mode: 0o700 })
   // PreToolUse と Stop は この印が消えるまで記録の消費を待つ
@@ -597,7 +607,7 @@ export function inspectDisplay(payload: Entry, dir = STATE_DIR, waitMs = 1000): 
     const open = previous.reduce<Fence>((state, text) => classifyLines(text, state).open, null)
     const result = hideEnglishLines(delta, open)
     if (result === null) return null
-    if (key !== null) recordHidden(dir, key, `${id}-${index}`, result.hidden)
+    recordHidden(dir, key, `${id}-${index}`, result.hidden)
     return result.content
   } finally {
     if (pending !== null) rmSync(pending, { force: true })
