@@ -297,7 +297,7 @@ function reportCorruptDb(env: Env, path: string, error: unknown): void {
   const primary = error.errno & 0xff
   if (primary !== SQLITE_CORRUPT && primary !== SQLITE_NOTADB) return
   env.stderr(
-    `statusline: 状態の DB が破損しているため使えません。${path} を削除すると、次の描画で作り直します。\n`,
+    `statusline: 状態の DB が破損しているため使えません。Claude Code をすべて終了し、数秒待ってから ${path} を削除してください。次に起動したときに作り直します。\n`,
   )
 }
 
