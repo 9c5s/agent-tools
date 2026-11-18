@@ -451,8 +451,9 @@ describe('状態の DB', () => {
       expect(Date.now() - started).toBeLessThan(500)
     } finally {
       child.kill('SIGKILL')
+      await child.exited
     }
-  })
+  }, 20_000)
 
   test('複数のプロセスが同時に日次コストを更新しても、新しいセッションの記録を失わない', async () => {
     const env = makeEnv()
