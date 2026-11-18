@@ -9,6 +9,7 @@ import {
   readFileSync,
   realpathSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
@@ -158,7 +159,9 @@ export function fileUri(absPath: string): string {
   const drive = /^[A-Za-z]:/.exec(absPath)?.[0] ?? ''
   const rest = absPath.slice(drive.length).replaceAll('\\', '/')
   const quoted = rest.split('/').map(quotePathSegment).join('/')
-  return `file://${drive ? `/${drive}` : ''}${quoted}`
+  if (drive) return `file:///${drive}${quoted}`
+  // UNC パス (//server/share) はサーバー名を authority に置く
+  return `${rest.startsWith('//') ? 'file:' : 'file://'}${quoted}`
 }
 
 // 丁度中間の値だけ偶数へ丸め、それ以外は toFixed と同じ結果にする
@@ -265,7 +268,7 @@ export function writeCache(path: string, obj: CacheObject): void {
   const suffix = `${process.pid}-${Math.random().toString(36).slice(2)}`
   const tmp = join(dirname(path), `claude-cache-${suffix}.tmp`)
   try {
-    writeFileSync(tmp, JSON.stringify(obj), 'utf8')
+    writeFileSync(tmp, JSON.stringify(obj), { encoding: 'utf8', mode: 0o600, flag: 'wx' })
     renameSync(tmp, path)
   } catch {
     try {
@@ -282,9 +285,20 @@ export function writeCache(path: string, obj: CacheObject): void {
   }
 }
 
+// これより古いロックは、取得したまま打ち切られたプロセスの残りとみなして消す
+const LOCK_STALE_MS = 5000
+
+function removeStaleLock(lockPath: string): void {
+  try {
+    if (Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS) unlinkSync(lockPath)
+  } catch {
+    // 並行するプロセスが先に消した場合は何もしない
+  }
+}
+
 // <path>.lock を排他的に作って read-modify-write を直列化する
-// timeoutMs 内に取得できなければ、可用性を優先してロック無しで実行する
-export function withFileLock<T>(path: string, fn: () => T, timeoutMs = 1000): T {
+// timeoutMs 内に取得できなければ、可用性を優先してロック無しで実行する (fn には取得できたかを渡す)
+export function withFileLock<T>(path: string, fn: (locked: boolean) => T, timeoutMs = 1000): T {
   const lockPath = `${path}.lock`
   const deadline = Date.now() + timeoutMs
   let fd: number | null = null
@@ -293,11 +307,12 @@ export function withFileLock<T>(path: string, fn: () => T, timeoutMs = 1000): T 
       fd = openSync(lockPath, 'wx')
       break
     } catch {
+      removeStaleLock(lockPath)
       Bun.sleepSync(10)
     }
   }
   try {
-    return fn()
+    return fn(fd !== null)
   } finally {
     if (fd !== null) {
       try {
@@ -685,11 +700,26 @@ export function isUsageCacheUsable(cache: CacheObject, now: number): boolean {
   return cachedAt !== null && now - cachedAt < MODEL_USAGE_STALE
 }
 
-// 更新の試行時刻を記録する (子プロセスの起動前に記録し、取得中の描画で重複起動させない)
-export function markUsageAttempt(env: Env, now: number): void {
+// TTL 内の値が無く、直近に更新を試行していなければ更新が要る
+function needsUsageRefresh(cache: CacheObject, now: number): boolean {
+  const fresh =
+    isUsageCacheUsable(cache, now) &&
+    Array.isArray(cache.data) &&
+    now - (safeFloat(cache._cached_at) ?? 0) < MODEL_USAGE_TTL
+  return !fresh && now - (safeFloat(cache._attempted_at) ?? 0) >= MODEL_USAGE_RETRY_INTERVAL
+}
+
+// 更新を起動する権利を取る。ロックの中で読み直して判定し、取れたら試行時刻を記録する
+// 子プロセスの起動前に記録し、取得中の描画や並行する描画で重複起動させない
+// ロックを取れないときは、並行する呼び出しが更新するとみなして権利を与えない
+export function claimUsageRefresh(env: Env, now: number): boolean {
   const path = cachePath(env, CACHE_FILES.modelUsage)
-  withFileLock(path, () => {
-    writeCache(path, { ...readCacheObject(path), _attempted_at: now })
+  return withFileLock(path, (locked) => {
+    if (!locked) return false
+    const cache = readCacheObject(path)
+    if (!needsUsageRefresh(cache, now)) return false
+    writeCache(path, { ...cache, _attempted_at: now })
+    return true
   })
 }
 
@@ -719,13 +749,7 @@ export function getModelUsage(env: Env): ModelUsage {
   const usable = isUsageCacheUsable(cache, now)
   const entries = usable && Array.isArray(cache.data) ? cache.data.filter(isModelUsageEntry) : null
   const weekly = usable && isRateBucket(cache.weekly) ? cache.weekly : null
-  const cachedAt = safeFloat(cache._cached_at) ?? 0
-  const attemptedAt = safeFloat(cache._attempted_at) ?? 0
-  const fresh = entries !== null && now - cachedAt < MODEL_USAGE_TTL
-  if (!fresh && now - attemptedAt >= MODEL_USAGE_RETRY_INTERVAL) {
-    markUsageAttempt(env, now)
-    spawnUsageRefresh(env)
-  }
+  if (needsUsageRefresh(cache, now) && claimUsageRefresh(env, now)) spawnUsageRefresh(env)
   return { entries, weekly }
 }
 

@@ -6,6 +6,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -217,6 +218,12 @@ describe('fileUri', () => {
     expect(sl.fileUri('/')).toBe('file:///')
     expect(sl.fileUri('D:\\')).toBe('file:///D:/')
   })
+
+  test('UNC パスは Python の as_uri と同じくサーバー名を authority に置く', () => {
+    expect(sl.fileUri('\\\\server\\share\\my repo\\x(1)')).toBe(
+      'file://server/share/my%20repo/x%281%29',
+    )
+  })
 })
 
 describe('formatAmount', () => {
@@ -315,7 +322,8 @@ describe('withFileLock', () => {
   test('ロックを作り、関数の戻り値を返し、終了時に消す', () => {
     const path = join(makeDir(), 'cache.json')
     const lock = `${path}.lock`
-    const result = sl.withFileLock(path, () => {
+    const result = sl.withFileLock(path, (locked) => {
+      expect(locked).toBe(true)
       expect(existsSync(lock)).toBe(true)
       return 42
     })
@@ -330,7 +338,20 @@ describe('withFileLock', () => {
     const fn = mock(() => 'ran')
     expect(sl.withFileLock(path, fn, 50)).toBe('ran')
     expect(fn).toHaveBeenCalledTimes(1)
+    expect(fn).toHaveBeenCalledWith(false)
     expect(existsSync(lock)).toBe(true)
+  })
+
+  test('古いロックは異常終了したプロセスの残りとみなして消し、取得してから実行する', () => {
+    const path = join(makeDir(), 'cache.json')
+    const lock = `${path}.lock`
+    writeFileSync(lock, '', 'utf8')
+    const past = new Date(Date.now() - 60_000)
+    utimesSync(lock, past, past)
+    const started = Date.now()
+    expect(sl.withFileLock(path, (locked) => locked)).toBe(true)
+    expect(Date.now() - started).toBeLessThan(500)
+    expect(existsSync(lock)).toBe(false)
   })
 
   test('関数が例外を投げてもロックを消す', () => {
@@ -556,15 +577,19 @@ describe('getExchangeRate', () => {
     expect(fetch).not.toHaveBeenCalled()
   })
 
-  test('API に失敗したら期限切れ (別の日) のキャッシュを返す', async () => {
-    const env = makeEnv()
+  test('別の日のキャッシュは使わずに取り直し、API にも失敗したら null を返す', async () => {
+    const fetch = mock(async (): Promise<Response> => {
+      throw new Error('offline')
+    })
+    const env = makeEnv({ fetch })
     writeJson(sl.cachePath(env, sl.CACHE_FILES.exchange), {
       _cached_at: 0,
       data: 148,
       currency: 'JPY',
-      date: sl.today(env),
+      date: '2000-01-01',
     })
-    expect(await sl.getExchangeRate('JPY', env)).toBe(148)
+    expect(await sl.getExchangeRate('JPY', env)).toBeNull()
+    expect(fetch).toHaveBeenCalledTimes(1)
   })
 
   test('API に失敗しキャッシュも無ければ null', async () => {
@@ -1099,6 +1124,23 @@ describe('getModelUsage', () => {
     sl.getModelUsage(env)
     expect(spawn).toHaveBeenCalledTimes(1)
     expect(readJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage))._attempted_at).toBe(NOW)
+  })
+
+  test('更新の権利はロックの中で読み直して判定し、先に権利を得た呼び出しがあれば与えない', () => {
+    const env = makeEnv()
+    writeUsageCache(env, NOW - 600, NOW - 600)
+    expect(sl.claimUsageRefresh(env, NOW)).toBe(true)
+    expect(sl.claimUsageRefresh(env, NOW)).toBe(false)
+    expect(readJson(sl.cachePath(env, sl.CACHE_FILES.modelUsage))._attempted_at).toBe(NOW)
+  })
+
+  test('ロックを取れないときは更新を起動しない', () => {
+    const spawn = mock(() => undefined)
+    const env = makeEnv({ spawn })
+    writeUsageCache(env, NOW - 600, NOW - 600)
+    writeFileSync(`${sl.cachePath(env, sl.CACHE_FILES.modelUsage)}.lock`, '', 'utf8')
+    sl.getModelUsage(env)
+    expect(spawn).not.toHaveBeenCalled()
   })
 
   test('直近に試行済みなら再試行を起動しない', () => {
