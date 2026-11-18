@@ -3,9 +3,9 @@
 // 入力 JSON の構造: https://code.claude.com/docs/en/statusline
 
 import { Database, SQLiteError } from 'bun:sqlite'
-import { readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdirSync, readFileSync, realpathSync, rmSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { basename, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { parseArgs as parseNodeArgs } from 'node:util'
 
 // stdin の JSON はこの型で受け取り、各セグメントが必要なフィールドの型を検査する
@@ -258,14 +258,27 @@ export type StateKey = (typeof STATE_KEYS)[keyof typeof STATE_KEYS]
 // value を呼び出し元へ返し、next があれば状態をそれで置き換える
 export type StateUpdate<T> = { value: T; next?: CacheObject }
 
+// 共有の一時ディレクトリでは他のユーザーが同じ名前のファイルや symlink を先に置けるため、
+// DB はユーザーごとのディレクトリに置く (Windows には uid が無く、一時ディレクトリがユーザーごとにある)
 export function statePath(env: Env): string {
-  return join(env.tmpDir(), STATE_DB_FILE)
+  return join(env.tmpDir(), `claude-statusline-${process.getuid?.() ?? 'user'}`, STATE_DB_FILE)
+}
+
+// ディレクトリを 0700 で作り、symlink でなく自分だけが使えるディレクトリか確かめる
+function ensureStateDir(dir: string): boolean {
+  try {
+    mkdirSync(dir, { mode: 0o700 })
+  } catch (error) {
+    if (!(isRecord(error) && error.code === 'EEXIST')) return false
+  }
+  const stat = lstatSync(dir)
+  if (!stat.isDirectory()) return false
+  const uid = process.getuid?.()
+  return uid === undefined || (stat.uid === uid && (stat.mode & 0o077) === 0)
 }
 
 function openStateDb(path: string): Database {
-  // 共有の一時ディレクトリで他のユーザーに読まれないよう、所有者だけが読み書きできる形で先に作る
-  // (SQLite はジャーナルを DB と同じ権限で作る)
-  writeFileSync(path, '', { flag: 'a', mode: 0o600 })
+  if (!ensureStateDir(dirname(path))) throw new Error(`unsafe state directory: ${dirname(path)}`)
   const db = new Database(path, { create: true })
   try {
     db.run(`PRAGMA busy_timeout = ${STATE_BUSY_TIMEOUT_MS}`)

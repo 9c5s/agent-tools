@@ -1,8 +1,17 @@
 import { Database } from 'bun:sqlite'
 import { afterEach, describe, expect, mock, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import * as sl from '../.claude/scripts/statusline'
 
 const tempDirs: string[] = []
@@ -309,6 +318,7 @@ describe('状態の DB', () => {
 
   test('DB でないファイルは消して作り直す', () => {
     const env = makeEnv()
+    mkdirSync(dirname(sl.statePath(env)), { mode: 0o700 })
     writeFileSync(sl.statePath(env), 'not a database '.repeat(100), 'utf8')
     expect(sl.updateState(env, sl.STATE_KEYS.git, () => ({ value: 'ok', next: { v: 1 } }))).toBe(
       'ok',
@@ -318,7 +328,8 @@ describe('状態の DB', () => {
 
   test('DB を開けなければ null を返し、update を呼ばない', () => {
     const env = makeEnv()
-    mkdirSync(sl.statePath(env))
+    // DB のパスにディレクトリがあると開けない
+    mkdirSync(sl.statePath(env), { recursive: true, mode: 0o700 })
     const update = mock(() => ({ value: 1 }))
     expect(sl.updateState(env, sl.STATE_KEYS.git, update)).toBeNull()
     expect(update).not.toHaveBeenCalled()
@@ -345,10 +356,33 @@ describe('状態の DB', () => {
     expect(sl.updateState(env, sl.STATE_KEYS.git, () => ({ value: 1 }))).toBe(1)
   })
 
-  test.skipIf(process.platform === 'win32')('DB は所有者だけが読み書きできる権限で作る', () => {
+  test.skipIf(process.platform === 'win32')(
+    'DB は所有者だけが使えるユーザーごとのディレクトリに置く',
+    () => {
+      const env = makeEnv()
+      sl.updateState(env, sl.STATE_KEYS.git, () => ({ value: null, next: {} }))
+      expect(statSync(dirname(sl.statePath(env))).mode & 0o777).toBe(0o700)
+    },
+  )
+
+  test.skipIf(process.platform === 'win32')(
+    'ほかのユーザーにも権限があるディレクトリでは DB を使わない',
+    () => {
+      const env = makeEnv()
+      const dir = dirname(sl.statePath(env))
+      mkdirSync(dir)
+      chmodSync(dir, 0o755)
+      expect(sl.updateState(env, sl.STATE_KEYS.git, () => ({ value: 1, next: {} }))).toBeNull()
+      expect(readdirSync(dir)).toEqual([])
+    },
+  )
+
+  test('状態のディレクトリが symlink なら DB を使わない', () => {
     const env = makeEnv()
-    sl.updateState(env, sl.STATE_KEYS.git, () => ({ value: null, next: {} }))
-    expect(statSync(sl.statePath(env)).mode & 0o777).toBe(0o600)
+    const target = makeDir()
+    symlinkSync(target, dirname(sl.statePath(env)), 'junction')
+    expect(sl.updateState(env, sl.STATE_KEYS.git, () => ({ value: 1, next: {} }))).toBeNull()
+    expect(readdirSync(target)).toEqual([])
   })
 
   test('ロックを持ったまま強制終了されたプロセスがあっても、すぐに取得でき、書きかけの変更は残らない', async () => {
@@ -1166,8 +1200,8 @@ describe('getModelUsage', () => {
   test('試行時刻を保存できないときは更新を起動しない', () => {
     const spawn = mock(() => undefined)
     const env = makeEnv({ spawn })
-    // 同名のディレクトリがあるとキャッシュを保存できない
-    mkdirSync(sl.statePath(env))
+    // DB のパスにディレクトリがあると状態を保存できない
+    mkdirSync(sl.statePath(env), { recursive: true, mode: 0o700 })
     sl.getModelUsage(env)
     expect(spawn).not.toHaveBeenCalled()
   })
