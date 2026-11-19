@@ -127,8 +127,9 @@ def check_schema(mf: MemoryFile) -> list[str]:
     else:
         if nested.get("node_type") != "memory":
             problems.append("metadata.node_type が memory ではない")
-        if nested.get("type") not in VALID_TYPES:
-            problems.append(f"metadata.type が不正: {nested.get('type')!r}")
+        mem_type = nested.get("type")
+        if not isinstance(mem_type, str) or mem_type not in VALID_TYPES:
+            problems.append(f"metadata.type が不正: {mem_type!r}")
     return problems
 
 
@@ -187,7 +188,11 @@ def lint_index(mem_dir: Path, files: list[MemoryFile]) -> list[Finding]:
 def lint_files(files: list[MemoryFile]) -> list[Finding]:
     """個別ファイルの frontmatter・スキーマ・wikilink・サイズを検査する"""
     findings = []
-    names = {mf.meta.get("name") for mf in files if isinstance(mf.meta, dict)}
+    names = {
+        mf.meta["name"]
+        for mf in files
+        if isinstance(mf.meta, dict) and isinstance(mf.meta.get("name"), str)
+    }
     for mf in files:
         target = mf.path.name
         if mf.parse_error == "no-frontmatter":
