@@ -235,14 +235,19 @@ def run_lint(projects_dir: Path, only: str | None) -> int:
     """lint を実行してレポートを出力する。エラーがあれば 1 を返す"""
     findings: list[Finding] = []
     all_files: list[MemoryFile] = []
+    matched = False
     for mem_dir in discover_memory_dirs(projects_dir):
         project = mem_dir.parent.name
         if only and project.lower() != only.lower():
             continue
+        matched = True
         files = load_memory_files(mem_dir)
         all_files.extend(files)
         findings.extend(lint_index(mem_dir, files))
         findings.extend(lint_files(files))
+    if only and not matched:
+        print(f"メモリディレクトリを持つプロジェクトが見つかりません: {only}", file=sys.stderr)
+        return 2
     if not only:
         findings.extend(lint_duplicates(all_files))
 
