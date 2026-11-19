@@ -147,14 +147,16 @@ def lint_index(mem_dir: Path, files: list[MemoryFile]) -> list[Finding]:
         return findings
 
     text = read_text(index_path)
-    linked = {m.group(1).split("/")[-1] for m in INDEX_LINK_RE.finditer(text)}
-    actual = {mf.path.name for mf in files}
+    linked = {
+        (mem_dir / m.group(1)).resolve(): m.group(1) for m in INDEX_LINK_RE.finditer(text)
+    }
+    actual = {mf.path.resolve(): mf.path.name for mf in files}
 
-    for missing in sorted(linked - actual):
+    for missing in sorted(linked[p] for p in linked.keys() - actual.keys()):
         findings.append(
             Finding("E", "E1", project, missing, "index が参照するファイルが存在しない")
         )
-    for unlisted in sorted(actual - linked):
+    for unlisted in sorted(actual[p] for p in actual.keys() - linked.keys()):
         findings.append(
             Finding("E", "E2", project, unlisted, "index に載っていないファイル")
         )
