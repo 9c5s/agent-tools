@@ -36,7 +36,8 @@ import yaml
 VALID_TYPES = {"user", "feedback", "project", "reference"}
 KEBAB_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 INDEX_LINK_RE = re.compile(r"\]\(([^)]+\.md)\)")
-INDEX_LINE_RE = re.compile(r"^- \[.*\]\([^)]+\.md\)")
+# 非貪欲にして hook 内のリンクではなく行頭のリンク先を捕捉する
+INDEX_LINE_RE = re.compile(r"^- \[.*?\]\(([^)]+\.md)\)")
 WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 FILE_SIZE_LIMIT = 8 * 1024
 INDEX_SIZE_LIMIT = 6 * 1024
@@ -277,6 +278,12 @@ def run_lint(projects_dir: Path, only: str | None) -> int:
     return 1 if errors else 0
 
 
+def index_row_target(mem_dir: Path, line: str) -> Path | None:
+    """index 行の先頭のリンクが指すパスを返す。index 行でなければ None を返す"""
+    m = INDEX_LINE_RE.match(line)
+    return (mem_dir / m.group(1)).resolve() if m else None
+
+
 def run_prune(projects_dir: Path, targets: list[str]) -> int:
     """指定されたメモリファイルを削除し、index 行も除去する"""
     status = 0
@@ -302,7 +309,7 @@ def run_prune(projects_dir: Path, targets: list[str]) -> int:
         removed = 0
         if index_path.is_file():
             lines = read_text(index_path).splitlines(keepends=True)
-            kept = [line for line in lines if f"({path.name})" not in line]
+            kept = [line for line in lines if index_row_target(path.parent, line) != path]
             removed = len(lines) - len(kept)
             if removed:
                 index_path.write_text("".join(kept), encoding="utf-8")
