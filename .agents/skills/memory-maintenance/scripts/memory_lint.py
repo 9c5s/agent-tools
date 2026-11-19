@@ -28,7 +28,7 @@ import argparse
 import hashlib
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -62,7 +62,6 @@ class MemoryFile:
     meta: dict | None = None
     body: str = ""
     parse_error: str | None = None
-    names: set[str] = field(default_factory=set)
 
 
 def read_text(path: Path) -> str:
