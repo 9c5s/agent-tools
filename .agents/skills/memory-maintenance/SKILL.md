@@ -50,7 +50,7 @@ uv run "<base>/scripts/memory_lint.py" [--project <スラッグ>]
 ```
 
 - 検査項目: index 双方向整合 (E1/E2)、frontmatter の存在と YAML 妥当性 (E3/E4)、正規形式 (E5)、wikilink 解決 (W1)、プロジェクト間の同名ファイル (W2)、MEMORY.md への直書き (W3)、サイズ閾値 (W4)
-- 終了コード: 0 = エラーなし (警告のみ)、1 = エラーあり、2 = projects ディレクトリ不明
+- 終了コード: 0 = エラーなし (警告のみ)、1 = エラーあり、2 = projects ディレクトリまたは `--project` のスラッグが見つからない
 
 手順:
 
