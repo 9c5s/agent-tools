@@ -1,6 +1,7 @@
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["pyyaml"]
+# # 6.0.3 以前には Windows の cp315 wheel がなく、ソースビルドになる
+# dependencies = ["pyyaml>=6.0.4"]
 # ///
 """Claude Code プロジェクトメモリの機械検査と整理を行うツール
 
